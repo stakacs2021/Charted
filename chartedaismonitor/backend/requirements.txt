@@ -3,3 +3,5 @@ uvicorn
 psycopg2-binary
 shapely
 httpx
+pytest
+websockets
