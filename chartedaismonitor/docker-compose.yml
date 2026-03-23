@@ -1,12 +1,14 @@
 services:
   db:
     image: postgis/postgis:15-3.4
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ais
       POSTGRES_USER: ais_user
-      POSTGRES_PASSWORD: ais_pass
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
     ports:
-      - "5432:5432"
+      # Host backups / local tools only; not exposed on LAN/WAN
+      - "127.0.0.1:5432:5432"
     volumes:
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
     healthcheck:
@@ -19,12 +21,47 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: chartedaismonitor-backend:latest
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://ais_user:ais_pass@db:5432/ais
+      DATABASE_URL: postgresql://ais_user:${POSTGRES_PASSWORD:-changeme}@db:5432/ais
     ports:
+      # LAN: use http://<server-ip>:8000 — or bind to 127.0.0.1:8000 for Nginx-only (see deploy/)
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
+
+  # Enable with: COMPOSE_PROFILES=ais in .env or: docker compose --profile ais up -d
+  ingest:
+    profiles:
+      - ais
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: chartedaismonitor-backend:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://ais_user:${POSTGRES_PASSWORD:-changeme}@db:5432/ais
+    command: ["python", "scripts/ingest_aisstream.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend

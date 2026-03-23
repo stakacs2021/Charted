@@ -1,3 +1,13 @@
+up:
+	docker compose up --build -d
+
+# Start stack including AISStream ingest (requires AISSTREAM_API_KEY in .env)
+up-ais:
+	COMPOSE_PROFILES=ais docker compose up --build -d
+
+down:
+	docker compose down
+
 # Run MPA import (requires: docker compose up -d, then)
 import-mpas:
 	docker compose exec backend python scripts/import_mpas.py
@@ -5,3 +15,6 @@ import-mpas:
 # Same using local Python (requires DATABASE_URL and deps installed in backend/)
 import-mpas-local:
 	cd backend && python scripts/import_mpas.py
+
+backup:
+	./scripts/backup-db.sh

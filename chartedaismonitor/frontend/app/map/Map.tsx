@@ -312,9 +312,9 @@ export default function Map() {
                 ).then((r) => (r.ok ? r.json() : null))
               )
             );
-            const allFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = allTrailResponses
-              .filter((r): r is VesselTrailResponse => r != null && r.line != null)
-              .map((r) => r.line);
+            const allFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = allTrailResponses.flatMap(
+              (r) => (r != null && r.line != null ? [r.line] : [])
+            );
             const allFc: GeoJSON.FeatureCollection<GeoJSON.LineString> = {
               type: "FeatureCollection",
               features: allFeatures,
@@ -343,9 +343,9 @@ export default function Map() {
               )
             )
           );
-          const trailFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = trailResponses
-            .filter((r): r is VesselTrailResponse => r != null && r.line != null)
-            .map((r) => r.line);
+          const trailFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = trailResponses.flatMap(
+            (r) => (r != null && r.line != null ? [r.line] : [])
+          );
           const trailFc: GeoJSON.FeatureCollection<GeoJSON.LineString> = {
             type: "FeatureCollection",
             features: trailFeatures,
@@ -423,7 +423,7 @@ export default function Map() {
 
     ensureTrailLayer();
 
-    const onClick = async (e: maplibregl.MapMouseEvent & maplibregl.EventData) => {
+    const onClick = async (e: maplibregl.MapMouseEvent) => {
       const layers = [vesselsLayerId, mpaFillLayerId];
       const features = map.queryRenderedFeatures(e.point, { layers });
       const top = features?.[0];

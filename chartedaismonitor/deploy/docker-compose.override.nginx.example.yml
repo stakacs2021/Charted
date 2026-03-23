@@ -1,0 +1,13 @@
+# Use when Nginx on the host proxies to frontend (3000) and backend (8000).
+# Only containers should be reachable via localhost; Nginx listens on :80 for LAN.
+#
+#   cp deploy/docker-compose.override.nginx.example.yml docker-compose.override.yml
+#   docker compose up -d --build
+#
+services:
+  backend:
+    ports:
+      - "127.0.0.1:8000:8000"
+  frontend:
+    ports:
+      - "127.0.0.1:3000:3000"

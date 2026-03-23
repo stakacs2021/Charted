@@ -1,20 +1,20 @@
 # Self-hosting AIS MPA Monitor on Ubuntu
 
-This guide describes running the stack on an Ubuntu PC (22.04+): Docker Compose for PostGIS and the API, optional Nginx reverse proxy and TLS, and a separate long-running AIS ingest process.
+This guide matches the **implemented** layout in this repo: Docker Compose runs **PostGIS**, **FastAPI**, **Next.js (standalone)**, and optionally a dedicated **AISStream ingest** service. Postgres is bound to **127.0.0.1:5432** only. Use your **LAN IP** for browsers on other machines until you have a public DNS name.
 
 ## Architecture
 
-- **Browser** → **Nginx** (optional) → **Next.js** (frontend) and **FastAPI** (backend API)
-- **Backend** → **PostgreSQL/PostGIS** (only on a private Docker network; do not expose Postgres to the public internet in production)
+- **Browser** → **Next.js** (port **3000**) and **FastAPI** (port **8000**), or optionally **Nginx** (port **80**) in front of both
+- **Backend / ingest** → **PostgreSQL/PostGIS** on the Compose network (`db:5432`); Postgres is **not** exposed on the LAN (only `127.0.0.1:5432` on the host for backups/tools)
 
 ## 1. Prerequisites
 
-- Ubuntu 22.04 or newer
+- Ubuntu 22.04 or newer (other Linux distros work with equivalent packages)
 - Docker Engine and Docker Compose plugin (`docker compose`)
 - `git`
-- Optional: `ufw` for firewall, `certbot` for Let’s Encrypt TLS
+- Optional: `ufw` for firewall, `nginx` for a single port **80**, `certbot` when you have a domain later
 
-Install Docker (follow [Docker’s official docs](https://docs.docker.com/engine/install/ubuntu/)).
+Install Docker: [Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/).
 
 ## 2. Clone and configure
 
@@ -26,123 +26,43 @@ cp .env.example .env
 
 Edit `.env`:
 
-- `DATABASE_URL` — For apps **on the host** talking to Postgres **published on localhost**:  
-  `postgresql://ais_user:YOUR_STRONG_PASSWORD@localhost:5432/ais`  
-  Match user/password/database to what you set for Postgres (see below).
-- `AISSTREAM_API_KEY` — From [AISStream](https://aisstream.io/) if you use WebSocket ingest.
-- `NEXT_PUBLIC_API_URL` — When the browser loads the frontend from another host or path, set this to the **public URL of your API** (e.g. `https://yourdomain.com/api` or `http://your-server-ip:8000`).
+| Variable | Purpose |
+|----------|---------|
+| `POSTGRES_PASSWORD` | Strong password; must match `DATABASE_URL` on the host and what Compose uses for `db` / `backend` / `ingest`. |
+| `DATABASE_URL` | For **host** tools (`pg_dump`, local pytest): `postgresql://ais_user:YOUR_PASSWORD@127.0.0.1:5432/ais` |
+| `NEXT_PUBLIC_API_URL` | **Before** building the frontend image: base URL **as the browser will use it**. LAN example: `http://192.168.1.50:8000` (replace with this machine’s IPv4). Same machine only: `http://127.0.0.1:8000`. |
+| `AISSTREAM_API_KEY` | From [AISStream](https://aisstream.io/) — required if you enable the **ingest** profile. |
+| `COMPOSE_PROFILES` | Set to `ais` to start the long-running AISStream ingester (see below). |
 
-**Security:** Never commit `.env`. Keep secrets out of Git.
+**Security:** Never commit `.env`.
 
-## 3. Harden `docker-compose.yml` for production
-
-Recommended changes:
-
-1. **Postgres password** — Replace the example password with a strong value and pass it via `.env` or Compose `environment` (parameterize `POSTGRES_PASSWORD` and `DATABASE_URL` consistently).
-2. **Do not publish Postgres to the world** — For production, either:
-   - Remove the `ports: "5432:5432"` mapping from the `db` service so only containers on the Compose network can reach Postgres, or  
-   - Bind to localhost only: `"127.0.0.1:5432:5432"` if you need host access for backups.
-3. **Backend** — Keep `8000:8000` only behind Nginx or firewall-restricted if possible.
-
-Rebuild after code changes:
-
-```bash
-docker compose up --build -d
-```
-
-## 4. Run database and API
+## 3. Start the stack
 
 ```bash
 docker compose up --build -d
 docker compose exec backend python scripts/import_mpas.py
 ```
 
-Verify: `curl -s http://localhost:8000/` → JSON status.
-
-## 5. Frontend in production
-
-The repo’s Compose file may only include `db` and `backend`. Run the frontend in one of these ways:
-
-### Option A: Node on the host
+Verify the API:
 
 ```bash
-cd frontend
-npm ci
-npm run build
-npm run start
+curl -s http://localhost:8000/
 ```
 
-Default Next.js listens on port 3000. Set `NEXT_PUBLIC_API_URL` before `npm run build` so the client bundle points at your API.
+Open the UI from another device on the LAN: `http://YOUR_LAN_IP:3000` (map, leaderboard). The UI calls the API at `NEXT_PUBLIC_API_URL`; if that URL is wrong or still `YOUR_LAN_IP`, rebuild the frontend (see below).
 
-### Option B: Next.js standalone in Docker
+### Changing `NEXT_PUBLIC_API_URL` or `POSTGRES_PASSWORD`
 
-Add a `frontend` service to Compose (or a separate Dockerfile) that runs `npm run build` and `node .next/standalone/server.js` (enable `output: 'standalone'` in `next.config.js` if you use this pattern).
+- **API URL baked into the frontend:** Changing `NEXT_PUBLIC_API_URL` requires rebuilding the frontend image:
+  ```bash
+  docker compose build --no-cache frontend
+  docker compose up -d frontend
+  ```
+- **Postgres password:** If you change `POSTGRES_PASSWORD` after the database volume already exists, credentials will not match unless you recreate the volume (destructive) or change the password inside Postgres manually. For a fresh start: `docker compose down -v` (drops DB data), then `up` again.
 
-### Option C: Static export
+## 4. AIS ingest (AISStream)
 
-If you switch to `output: 'export'`, serve the `out/` directory with Nginx. (Map routes and env usage must be compatible with static export.)
-
-## 6. Nginx reverse proxy (example)
-
-Install Nginx on the host. Example server block (HTTP) — adjust `server_name` and upstream ports:
-
-```nginx
-server {
-    listen 80;
-    server_name yourdomain.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location /api/ {
-        proxy_pass http://127.0.0.1:8000/;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-If the frontend expects the API at `http://localhost:8000`, either:
-
-- Proxy `/api` to the backend and set `NEXT_PUBLIC_API_URL` to `https://yourdomain.com/api`, or  
-- Serve the API on a subdomain (e.g. `api.yourdomain.com`) and set `NEXT_PUBLIC_API_URL` accordingly.
-
-Reload Nginx: `sudo nginx -t && sudo systemctl reload nginx`.
-
-## 7. TLS (Let’s Encrypt)
-
-With a public DNS name pointing to your server:
-
-```bash
-sudo apt install certbot python3-certbot-nginx
-sudo certbot --nginx -d yourdomain.com
-```
-
-For LAN-only use, you can skip TLS or use a self-signed certificate (browsers will warn).
-
-## 8. Firewall
-
-```bash
-sudo ufw allow OpenSSH
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw enable
-```
-
-Do not open Postgres (5432) to the public internet.
-
-## 9. AIS ingest (long-running)
-
-Run the WebSocket ingester **outside** the API process so restarts of the API do not stop ingestion. Examples:
+The **ingest** service is behind the Compose profile **`ais`** so the stack can run without an API key.
 
 **Foreground (testing):**
 
@@ -150,42 +70,104 @@ Run the WebSocket ingester **outside** the API process so restarts of the API do
 docker compose exec backend python scripts/ingest_aisstream.py
 ```
 
-**Dedicated Compose service (recommended):** add a service using the same backend image:
+**Recommended — dedicated service:**
 
-```yaml
-  ingest:
-    build: ./backend
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql://ais_user:ais_pass@db:5432/ais
-    command: python scripts/ingest_aisstream.py
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
+1. Set `AISSTREAM_API_KEY` in `.env`.
+2. Add `COMPOSE_PROFILES=ais` to `.env` **or** run:
+   ```bash
+   COMPOSE_PROFILES=ais docker compose up -d --build
+   ```
+
+Ingest uses the same backend image and connects to `db` on the internal network.
+
+## 5. Optional: Nginx on port 80 (single HTTP entry)
+
+Use this when you want clients to open `http://YOUR_LAN_IP/` only (no `:3000` / `:8000` in the URL).
+
+1. **Bind Compose to loopback** so only Nginx listens on the LAN:
+   ```bash
+   cp deploy/docker-compose.override.nginx.example.yml docker-compose.override.yml
+   docker compose up -d --build
+   ```
+2. Set **`NEXT_PUBLIC_API_URL=http://YOUR_LAN_IP/api`** (no trailing slash), then rebuild the frontend:
+   ```bash
+   docker compose build --no-cache frontend && docker compose up -d frontend
+   ```
+3. Install Nginx and install the site file:
+   ```bash
+   sudo cp deploy/nginx-aismonitor-ip.conf /etc/nginx/sites-available/chartedaismonitor
+   sudo ln -sf /etc/nginx/sites-available/chartedaismonitor /etc/nginx/sites-enabled/
+   sudo nginx -t && sudo systemctl reload nginx
+   ```
+
+The sample config proxies `/` → `127.0.0.1:3000` and `/api/` → `127.0.0.1:8000/`.
+
+## 6. TLS (Let’s Encrypt) — when you have a domain
+
+With DNS pointing at your server:
+
+```bash
+sudo apt install certbot python3-certbot-nginx
+sudo certbot --nginx -d yourdomain.com
 ```
 
-Or a **systemd** unit that runs `docker compose run --rm ingest` or the script on the host with `DATABASE_URL` pointing at `localhost` if Postgres is published locally.
+For LAN-only or raw IP, skip TLS or use a self-signed cert (browsers will warn).
 
-## 10. Backups
+## 7. Firewall
 
-Schedule periodic dumps:
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+# If not using Nginx, allow app ports for LAN access:
+sudo ufw allow 3000/tcp
+sudo ufw allow 8000/tcp
+sudo ufw enable
+```
+
+Do **not** expose Postgres **5432** to the internet. The default Compose file binds Postgres to **127.0.0.1** only.
+
+## 8. Backups
+
+From the `chartedaismonitor` directory:
+
+```bash
+./scripts/backup-db.sh backup-$(date +%F).sql
+```
+
+Or manually:
 
 ```bash
 docker compose exec db pg_dump -U ais_user ais > backup-$(date +%F).sql
 ```
 
-Store backups off the machine you use for development.
+Store backups off the machine.
 
-## 11. Boot persistence
+## 9. Boot persistence
 
-Use `restart: unless-stopped` on Compose services. Optionally enable Docker to start on boot and add a systemd unit that runs `docker compose up -d` in your project directory after network is online.
+Compose services use `restart: unless-stopped`. Enable Docker on boot (distribution default on Ubuntu). Optional **systemd** unit:
 
-## Checklist
+```bash
+# Edit paths in the file, then:
+sudo cp deploy/chartedaismonitor.service.example /etc/systemd/system/chartedaismonitor.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now chartedaismonitor.service
+```
 
-- [ ] Strong database password; `.env` not in Git  
-- [ ] Postgres not exposed publicly  
-- [ ] `NEXT_PUBLIC_API_URL` matches how browsers reach the API  
+## 10. Checklist
+
+- [ ] Strong `POSTGRES_PASSWORD`; `.env` not in Git  
+- [ ] Postgres not exposed on `0.0.0.0:5432` (default is `127.0.0.1:5432` only)  
+- [ ] `NEXT_PUBLIC_API_URL` matches how browsers reach the API; frontend rebuilt after changes  
 - [ ] Nginx/TLS configured if exposed to the internet  
-- [ ] Ingest running continuously with `restart` policy  
+- [ ] Ingest running with `COMPOSE_PROFILES=ais` when using AISStream  
 - [ ] Backups scheduled  
+
+## Files added for self-hosting
+
+- `docker-compose.yml` — `db`, `backend`, `frontend`, optional `ingest` (profile `ais`)
+- `frontend/Dockerfile` — Next.js `standalone` image  
+- `deploy/nginx-aismonitor-ip.conf` — Nginx example for IP / default server  
+- `deploy/docker-compose.override.nginx.example.yml` — loopback-only ports for use with Nginx  
+- `deploy/chartedaismonitor.service.example` — systemd template  
+- `scripts/backup-db.sh` — `pg_dump` helper  

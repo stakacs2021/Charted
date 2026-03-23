@@ -23,7 +23,7 @@ chartedaismonitor/
 ├── backend/                 # FastAPI API and ingestion
 │   ├── main.py              # API routes (zones, vessels/live, vessels/{mmsi}/trail, zones/{id}/stats)
 │   ├── database.py          # Postgres connection (DATABASE_URL)
-│   ├── Dockerfile           # Image for API server
+│   ├── Dockerfile           # Image for API server and ingest service
 │   ├── requirements.txt     # Python deps (fastapi, uvicorn, psycopg2-binary, shapely, httpx, pytest)
 │   ├── scripts/
 │   │   ├── import_mpas.py   # Import California MPA GeoJSON into zones table
@@ -34,15 +34,20 @@ chartedaismonitor/
 │       └── test_ingest_entry_detection.py  # Pytest: outside→inside creates one violation
 ├── db/
 │   └── init.sql             # PostGIS, zones, vessels, vessel_positions, mpa_violations
-├── frontend/                # Next.js app
+├── deploy/                  # Nginx sample, systemd unit, Compose override for Nginx
+├── frontend/                # Next.js app (standalone Docker image)
+│   ├── Dockerfile
 │   ├── app/
 │   │   ├── page.tsx         # Home
 │   │   ├── map/page.tsx     # Map page wrapper
 │   │   └── map/Map.tsx      # MapLibre: zones, live vessels, trails, MPA click popups
 │   └── package.json         # next, maplibre-gl, react
-├── docker-compose.yml       # db (PostGIS), backend (FastAPI)
-├── .env.example             # DATABASE_URL, AISSTREAM_API_KEY, AISHUB_USERNAME, AIS_API_URL
-├── SELF_HOST.md             # Production-style deploy on Ubuntu
+├── scripts/
+│   └── backup-db.sh         # pg_dump helper (Postgres on 127.0.0.1:5432)
+├── docker-compose.yml       # db, backend, frontend; ingest optional (profile `ais`)
+├── .env.example             # POSTGRES_PASSWORD, DATABASE_URL, NEXT_PUBLIC_API_URL, AISSTREAM_API_KEY
+├── Makefile                 # up, up-ais, import-mpas, backup
+├── SELF_HOST.md             # Production-style deploy on Ubuntu (implemented stack)
 ├── CONTRIBUTING.md          # Git workflow and weekly commit habit
 └── README.md
 ```
@@ -56,13 +61,22 @@ chartedaismonitor/
 ```bash
 cd chartedaismonitor
 cp .env.example .env
+# Edit .env: set POSTGRES_PASSWORD, NEXT_PUBLIC_API_URL (e.g. http://YOUR_LAN_IP:8000), AISSTREAM_API_KEY as needed
 docker compose up --build -d
 ```
+
+This starts **PostGIS**, **FastAPI** (port **8000**), and **Next.js** (port **3000**). Optional **AISStream ingest**: add `COMPOSE_PROFILES=ais` to `.env` or run `make up-ais` after setting `AISSTREAM_API_KEY`.
 
 If you change backend code, rebuild so the API container uses it:
 
 ```bash
 docker compose up --build -d backend
+```
+
+If you change **`NEXT_PUBLIC_API_URL`**, rebuild the frontend image (the value is baked in at build time):
+
+```bash
+docker compose build --no-cache frontend && docker compose up -d frontend
 ```
 
 Wait until backend is healthy. Then import MPA zones (required for point-in-zone and zone stats):
@@ -78,14 +92,14 @@ With DB reachable at `localhost:5432`, use the **same Python environment** for b
 ```bash
 cd chartedaismonitor/backend
 pip install -r requirements.txt
-export DATABASE_URL=postgresql://ais_user:ais_pass@localhost:5432/ais
+export DATABASE_URL=postgresql://ais_user:YOUR_PASSWORD@127.0.0.1:5432/ais
 pytest tests/ -v
 ```
 
-Or run pytest inside the backend container (DB host = `db`):
+Or run pytest inside the backend container (DB host = `db`; password must match `.env`):
 
 ```bash
-docker compose exec backend sh -c 'cd /app && DATABASE_URL=postgresql://ais_user:ais_pass@db:5432/ais pytest tests/ -v'
+docker compose exec backend sh -c 'cd /app && pytest tests/ -v'
 ```
 
 Expected: `test_outside_to_inside_creates_single_entry_violation` passes (one `mpa_violations` row when a vessel moves from outside a test zone to inside).
@@ -181,11 +195,11 @@ AIS ingestion fills the `vessels` and `vessel_positions` tables and records MPA 
    AISSTREAM_API_KEY=your_api_key
    ```
 
-3. Start the WebSocket ingester (long-running; leave it in a terminal or run in background):
+3. Run the WebSocket ingester continuously — either add `COMPOSE_PROFILES=ais` to `.env` and `docker compose up -d` (see **SELF_HOST.md**), or in a terminal:
    ```bash
    docker compose exec backend python scripts/ingest_aisstream.py
    ```
-   It will connect to `wss://stream.aisstream.io/v0/stream`, subscribe to the California bounding box, and process `PositionReport` (and related) messages. Stop with Ctrl+C. On disconnect it will try to reconnect.
+   It will connect to `wss://stream.aisstream.io/v0/stream`, subscribe to the California bounding box, and process `PositionReport` (and related) messages. Foreground mode: stop with Ctrl+C. On disconnect it will try to reconnect.
 
 4. Open the map; with “Show live vessels” and “Show MPA violator trails” on, you should see vessels and trails for any that have entered an MPA.
 
@@ -293,10 +307,10 @@ Open http://localhost:3000. Set `NEXT_PUBLIC_API_URL=http://localhost:8000` in `
 
 | Step | Command / action |
 |------|-------------------|
-| Start stack | `docker compose up --build -d` |
+| Start stack | `docker compose up --build -d` (frontend in Docker on port 3000) |
 | Import MPAs | `docker compose exec backend python scripts/import_mpas.py` |
-| Ingest AIS | Option A: `docker compose exec backend python scripts/ingest_ais.py --source scripts/sample_ais.json`. Or Option B/C with `AIS_API_URL` and `--loop` if needed. Or Option D: `curl -X POST http://localhost:8000/vessels/update ...` |
-| Frontend | `cd frontend && npm install && npm run dev` → http://localhost:3000 |
+| Ingest AIS | AISStream: `COMPOSE_PROFILES=ais` / `make up-ais`, or `docker compose exec backend python scripts/ingest_aisstream.py`. Sample: `docker compose exec backend python scripts/ingest_ais.py --source scripts/sample_ais.json`. Or `curl -X POST http://localhost:8000/vessels/update ...` |
+| Frontend (dev) | Optional: `cd frontend && npm install && npm run dev` → http://localhost:3000 |
 | UI | Map + zones, live vessels, “Show MPA violator trails”, vessel click → popup/trail, MPA click → stats popup |
 | Backend tests | `cd backend && DATABASE_URL=... pytest tests/ -v` |
 | API smoke | `curl http://localhost:8000/` and curl commands above |
