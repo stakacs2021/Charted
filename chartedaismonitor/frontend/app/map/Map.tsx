@@ -6,12 +6,28 @@ import "maplibre-gl/dist/maplibre-gl.css";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+/** Regional-indicator flag emoji from ISO 3166-1 alpha-2 (e.g. US -> 🇺🇸). */
+function iso2ToFlagEmoji(iso2: string | null | undefined): string {
+  if (!iso2 || iso2.length !== 2) return "";
+  const u = iso2.toUpperCase();
+  const a = u.charCodeAt(0) - 65 + 0x1f1e6;
+  const b = u.charCodeAt(1) - 65 + 0x1f1e6;
+  if (a < 0x1f1e6 || a > 0x1f1ff || b < 0x1f1e6 || b > 0x1f1ff) return "";
+  return String.fromCodePoint(a, b);
+}
+
 type GeoJSONFeature = GeoJSON.Feature<GeoJSON.Geometry, { id?: number; name?: string; designation?: string }>;
 type GeoJSONFC = GeoJSON.FeatureCollection<GeoJSON.Geometry, { id?: number; name?: string; designation?: string }>;
 
 type LiveVessel = {
   mmsi: string;
   name?: string | null;
+  country?: string | null;
+  callsign?: string | null;
+  country_iso2?: string | null;
+  cog?: number | null;
+  true_heading?: number | null;
+  bearing_deg?: number | null;
   lat: number;
   lon: number;
   last_ts?: string | null;
@@ -33,7 +49,8 @@ export default function Map() {
   const [zones, setZones] = useState<GeoJSONFC | null>(null);
   const [zonesVisible, setZonesVisible] = useState(true);
   const [vesselsVisible, setVesselsVisible] = useState(true);
-  const [trailsVisible, setTrailsVisible] = useState(true);
+  const [violatorTrailsVisible, setViolatorTrailsVisible] = useState(true);
+  const [allVesselTrailsVisible, setAllVesselTrailsVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -125,29 +142,85 @@ export default function Map() {
       features: [],
     };
 
+    const shipIconGreen =
+      "data:image/svg+xml;base64," +
+      btoa(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2 L22 22 L2 22 Z" fill="#1d7" stroke="#fff" stroke-width="1"/></svg>'
+      );
+    const shipIconRed =
+      "data:image/svg+xml;base64," +
+      btoa(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 2 L22 22 L2 22 Z" fill="#d14" stroke="#fff" stroke-width="1"/></svg>'
+      );
+
+    const addShipIcons = () => {
+      if (map.hasImage("ship-green") && map.hasImage("ship-red")) return;
+      const loadImg = (name: string, src: string) =>
+        new Promise<void>((resolve) => {
+          const img = new Image();
+          img.onload = () => {
+            if (!map.hasImage(name)) map.addImage(name, img);
+            resolve();
+          };
+          img.src = src;
+        });
+      Promise.all([loadImg("ship-green", shipIconGreen), loadImg("ship-red", shipIconRed)]);
+    };
+
     const upsertSourceAndLayer = () => {
       if (!map.getSource(sourceId)) {
         map.addSource(sourceId, { type: "geojson", data: emptyFc });
       }
+      addShipIcons();
       if (!map.getLayer(layerId)) {
         map.addLayer({
           id: layerId,
-          type: "circle",
+          type: "symbol",
           source: sourceId,
-          paint: {
-            "circle-radius": 4.5,
-            "circle-color": ["case", ["boolean", ["get", "inside"], false], "#d14", "#1d7"],
-            "circle-stroke-color": "#fff",
-            "circle-stroke-width": 1,
-            "circle-opacity": 0.9,
+          layout: {
+            "icon-image": ["case", ["boolean", ["get", "inside"], false], "ship-red", "ship-green"],
+            "icon-size": 0.6,
+            "icon-rotate": ["coalesce", ["get", "bearing_deg"], 0],
+            "icon-rotation-alignment": "map",
+            "icon-allow-overlap": true,
+            "icon-ignore-placement": true,
           },
         });
       }
     };
 
+    const allTrailSourceId = "all-vessel-trails";
+    const allTrailLayerId = "all-vessel-trails-line";
+    const MAX_ALL_VESSEL_TRAILS = 40;
+    const ALL_TRAIL_HOURS = 3;
+    const ALL_TRAIL_LIMIT = 200;
+
     const violatorTrailSourceId = "violator-trails";
     const violatorTrailLayerId = "violator-trails-line";
     const MAX_VIOLATOR_TRAILS = 25;
+
+    const ensureAllVesselTrailLayer = () => {
+      const emptyFc: GeoJSON.FeatureCollection<GeoJSON.LineString> = { type: "FeatureCollection", features: [] };
+      if (!map.getSource(allTrailSourceId)) {
+        map.addSource(allTrailSourceId, { type: "geojson", data: emptyFc });
+      }
+      if (!map.getLayer(allTrailLayerId)) {
+        map.addLayer(
+          {
+            id: allTrailLayerId,
+            type: "line",
+            source: allTrailSourceId,
+            paint: {
+              "line-color": "#0369a1",
+              "line-width": 1.5,
+              "line-opacity": 0.65,
+              "line-dasharray": [2, 2],
+            },
+          },
+          layerId
+        );
+      }
+    };
 
     const ensureViolatorTrailLayer = () => {
       const emptyFc: GeoJSON.FeatureCollection<GeoJSON.LineString> = { type: "FeatureCollection", features: [] };
@@ -174,13 +247,31 @@ export default function Map() {
 
     const fetchAndUpdate = async () => {
       try {
-        const res = await fetch(`${API_URL}/vessels/live?limit=500`);
+        const bounds = map.getBounds();
+        const params = new URLSearchParams({
+          min_lat: bounds.getSouth().toString(),
+          max_lat: bounds.getNorth().toString(),
+          min_lon: bounds.getWest().toString(),
+          max_lon: bounds.getEast().toString(),
+          limit: "500",
+        });
+        const res = await fetch(`${API_URL}/vessels/live?${params.toString()}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data: LiveVessel[] = await res.json();
 
         const fc: GeoJSON.FeatureCollection<
           GeoJSON.Point,
-          { mmsi: string; name?: string; inside?: boolean; has_mpa_violations?: boolean; last_ts?: string | null }
+          {
+            mmsi: string;
+            name?: string;
+            country?: string | null;
+            country_iso2?: string | null;
+            callsign?: string | null;
+            bearing_deg?: number | null;
+            inside?: boolean;
+            has_mpa_violations?: boolean;
+            last_ts?: string | null;
+          }
         > = {
           type: "FeatureCollection",
           features: data
@@ -191,6 +282,11 @@ export default function Map() {
               properties: {
                 mmsi: v.mmsi,
                 name: v.name ?? undefined,
+                country: v.country ?? null,
+                country_iso2: v.country_iso2 ?? null,
+                callsign: v.callsign ?? null,
+                bearing_deg:
+                  v.bearing_deg != null && Number.isFinite(v.bearing_deg) ? v.bearing_deg : null,
                 inside: v.inside_any_mpa,
                 has_mpa_violations: v.has_mpa_violations,
                 last_ts: v.last_ts ?? null,
@@ -201,6 +297,38 @@ export default function Map() {
 
         const src = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
         if (src) src.setData(fc);
+
+        ensureAllVesselTrailLayer();
+        if (allVesselTrailsVisible) {
+          const allMmsis = data
+            .filter((v) => Number.isFinite(v.lat) && Number.isFinite(v.lon))
+            .map((v) => v.mmsi)
+            .slice(0, MAX_ALL_VESSEL_TRAILS);
+          if (allMmsis.length > 0) {
+            const allTrailResponses = await Promise.all(
+              allMmsis.map((mmsi) =>
+                fetch(
+                  `${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${ALL_TRAIL_HOURS}&limit=${ALL_TRAIL_LIMIT}`
+                ).then((r) => (r.ok ? r.json() : null))
+              )
+            );
+            const allFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = allTrailResponses
+              .filter((r): r is VesselTrailResponse => r != null && r.line != null)
+              .map((r) => r.line);
+            const allFc: GeoJSON.FeatureCollection<GeoJSON.LineString> = {
+              type: "FeatureCollection",
+              features: allFeatures,
+            };
+            const allSrc = map.getSource(allTrailSourceId) as maplibregl.GeoJSONSource | undefined;
+            if (allSrc) allSrc.setData(allFc);
+          } else {
+            const allSrc = map.getSource(allTrailSourceId) as maplibregl.GeoJSONSource | undefined;
+            if (allSrc) allSrc.setData({ type: "FeatureCollection", features: [] });
+          }
+        } else {
+          const allSrc = map.getSource(allTrailSourceId) as maplibregl.GeoJSONSource | undefined;
+          if (allSrc) allSrc.setData({ type: "FeatureCollection", features: [] });
+        }
 
         const violatorMmsis = data
           .filter((v) => v.has_mpa_violations && Number.isFinite(v.lat) && Number.isFinite(v.lon))
@@ -236,9 +364,9 @@ export default function Map() {
     upsertSourceAndLayer();
     fetchAndUpdate();
 
-    const interval = window.setInterval(fetchAndUpdate, 10_000);
+    const interval = window.setInterval(fetchAndUpdate, 5_000);
     return () => window.clearInterval(interval);
-  }, [mapLoaded]);
+  }, [mapLoaded, allVesselTrailsVisible]);
 
   useEffect(() => {
     const map = mapInstance.current;
@@ -253,8 +381,16 @@ export default function Map() {
     if (!map) return;
     const layerId = "violator-trails-line";
     if (!map.getLayer(layerId)) return;
-    map.setLayoutProperty(layerId, "visibility", trailsVisible ? "visible" : "none");
-  }, [trailsVisible]);
+    map.setLayoutProperty(layerId, "visibility", violatorTrailsVisible ? "visible" : "none");
+  }, [violatorTrailsVisible]);
+
+  useEffect(() => {
+    const map = mapInstance.current;
+    if (!map) return;
+    const layerId = "all-vessel-trails-line";
+    if (!map.getLayer(layerId)) return;
+    map.setLayoutProperty(layerId, "visibility", allVesselTrailsVisible ? "visible" : "none");
+  }, [allVesselTrailsVisible]);
 
   useEffect(() => {
     const map = mapInstance.current;
@@ -325,7 +461,16 @@ export default function Map() {
       }
 
       if (layerId === vesselsLayerId) {
-        const props = top.properties as { mmsi?: string; name?: string; has_mpa_violations?: boolean } | undefined;
+        const props = top.properties as {
+          mmsi?: string;
+          name?: string;
+          country?: string | null;
+          country_iso2?: string | null;
+          callsign?: string | null;
+          bearing_deg?: number | null;
+          has_mpa_violations?: boolean;
+          last_ts?: string | null;
+        } | undefined;
         const mmsi = props?.mmsi;
         if (!mmsi) return;
         const hasViolations = props?.has_mpa_violations === true;
@@ -347,12 +492,37 @@ export default function Map() {
             const src = map.getSource(trailSourceId) as maplibregl.GeoJSONSource | undefined;
             if (src) src.setData({ type: "FeatureCollection", features: [] });
           }
+          const flag = iso2ToFlagEmoji(props?.country_iso2 ?? undefined);
           new maplibregl.Popup({ closeButton: true, closeOnClick: true })
             .setLngLat(e.lngLat)
             .setHTML(
               `<div style="font-family:system-ui;font-size:13px;">
-                <div style="font-weight:600;">${(props?.name as string) || "Vessel"} ${mmsi}</div>
-                ${hasViolations ? `<div style="color:#c00;">Passed through MPA</div><div style="color:#555;">Trail points: ${trailCount}</div>` : '<div style="color:#555;">No MPA passage</div>'}
+                <div style="font-weight:600;">${flag ? `${flag} ` : ""}${(props?.name as string) || "Vessel"} ${mmsi}</div>
+                ${
+                  props?.country
+                    ? `<div style="color:#555;">${props.country}${props?.country_iso2 ? ` (${props.country_iso2})` : ""}</div>`
+                    : ""
+                }
+                ${
+                  props?.callsign
+                    ? `<div style="color:#555;">Callsign: ${props.callsign}</div>`
+                    : ""
+                }
+                ${
+                  props?.bearing_deg != null && Number.isFinite(props.bearing_deg)
+                    ? `<div style="color:#444;font-size:12px;">Course: ${props.bearing_deg.toFixed(0)}°</div>`
+                    : ""
+                }
+                ${
+                  props?.last_ts
+                    ? `<div style="color:#777;font-size:12px;margin-top:2px;">Last update: ${props.last_ts}</div>`
+                    : ""
+                }
+                ${
+                  hasViolations
+                    ? `<div style="color:#c00;margin-top:4px;">Passed through MPA</div><div style="color:#555;">Trail points: ${trailCount}</div>`
+                    : '<div style="color:#555;margin-top:4px;">No MPA passage</div>'
+                }
               </div>`
             )
             .addTo(map);
@@ -413,10 +583,18 @@ export default function Map() {
         <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginTop: 8 }}>
           <input
             type="checkbox"
-            checked={trailsVisible}
-            onChange={(e) => setTrailsVisible(e.target.checked)}
+            checked={violatorTrailsVisible}
+            onChange={(e) => setViolatorTrailsVisible(e.target.checked)}
           />
           Show MPA violator trails
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginTop: 8 }}>
+          <input
+            type="checkbox"
+            checked={allVesselTrailsVisible}
+            onChange={(e) => setAllVesselTrailsVisible(e.target.checked)}
+          />
+          Show trails (all vessels in view, max 40)
         </label>
         <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
           {zones ? `${zones.features.length} zones` : "Loading…"}

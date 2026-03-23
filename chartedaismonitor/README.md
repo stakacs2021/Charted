@@ -2,6 +2,18 @@
 
 Web app that monitors vessel locations near the California coast and checks whether they are inside California Marine Protected Areas (MPAs). It supports live vessel traffic on a map, vessel trails (dotted paths), and MPA violation counts (entry-only). **Stack:** Backend (Python + FastAPI), DB (PostgreSQL + PostGIS in Docker), Frontend (Next.js, TypeScript), Map (MapLibre GL).
 
+### Features (map and API)
+
+- **Nationality / flag** — Country name and ISO2 code are derived from the vessel MMSI’s **Maritime Identification Digits (MID)** (first three digits for ship MMSI). This is the standard ITU registry for the flag state; it may not match every edge case in the real world. Callsign is stored when provided by AIS. See [`backend/mmsi_mid.py`](backend/mmsi_mid.py).
+- **Course / heading** — COG and true heading are ingested when present; the map rotates ship icons using **bearing** (COG, else heading, else bearing from the last two stored positions).
+- **Trails** — Optional **MPA violator** trails (red) and optional **all vessels in view** trails (blue, capped at 40 ships per refresh for performance).
+- **Leaderboard** — `/leaderboard` lists top MMSIs by MPA entry count.
+
+### Docs
+
+- **[Self-hosting on Ubuntu](SELF_HOST.md)** — Docker, Nginx, TLS, firewall, ingest service, backups.
+- **[Contributing & Git cadence](CONTRIBUTING.md)** — Weekly commits, branches, secrets hygiene.
+
 ---
 
 ## Project structure
@@ -30,6 +42,8 @@ chartedaismonitor/
 │   └── package.json         # next, maplibre-gl, react
 ├── docker-compose.yml       # db (PostGIS), backend (FastAPI)
 ├── .env.example             # DATABASE_URL, AISSTREAM_API_KEY, AISHUB_USERNAME, AIS_API_URL
+├── SELF_HOST.md             # Production-style deploy on Ubuntu
+├── CONTRIBUTING.md          # Git workflow and weekly commit habit
 └── README.md
 ```
 

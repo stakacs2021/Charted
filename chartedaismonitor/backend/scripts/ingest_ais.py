@@ -44,6 +44,7 @@ Generic URL or file (set AIS_API_URL or pass --source):
 
 import argparse
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ from psycopg2.extensions import connection as PGConnection
 # Allow importing database.DATABASE_URL
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from database import DATABASE_URL  # type: ignore
+from mmsi_mid import mmsi_to_country
 
 
 @dataclass
@@ -67,6 +69,44 @@ class VesselRecord:
     lon: float
     ts: datetime
     name: Optional[str] = None
+    country: Optional[str] = None
+    country_iso2: Optional[str] = None
+    callsign: Optional[str] = None
+    cog: Optional[float] = None
+    true_heading: Optional[float] = None
+
+
+def bearing_deg_lonlat(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Initial bearing from point1 to point2 in degrees (0–360, clockwise from north)."""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    brng = math.degrees(math.atan2(y, x))
+    return (brng + 360.0) % 360.0
+
+
+def parse_ais_angle_deg(raw: Any) -> Optional[float]:
+    """
+    AIS COG / true heading in degrees: valid 0–359.9; 511/3601 etc. mean not available.
+    Some feeds send 1/10 degree units as integers (0–3600).
+    """
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if abs(v - 511) < 0.5 or abs(v - 3601) < 0.5:
+        return None
+    if v >= 3600:
+        return None
+    if v > 360:
+        v = v / 10.0
+    if v < 0 or v >= 360:
+        return None
+    return v % 360.0
 
 
 def _parse_timestamp(raw: Any) -> datetime:
@@ -133,6 +173,11 @@ def normalize_record(raw: Dict[str, Any]) -> Optional[VesselRecord]:
         raw.get("SHIPNAME"),
         raw.get("NAME"),
     )
+    callsign = _first(
+        raw.get("callsign"),
+        raw.get("Callsign"),
+        raw.get("CALLSIGN"),
+    )
     ts = _parse_timestamp(
         _first(
             raw.get("timestamp"),
@@ -143,7 +188,32 @@ def normalize_record(raw: Dict[str, Any]) -> Optional[VesselRecord]:
         )
     )
 
-    return VesselRecord(mmsi=str(mmsi), lat=lat_f, lon=lon_f, ts=ts, name=name)
+    country = None
+    country_iso2 = None
+    info = mmsi_to_country(str(mmsi))
+    if info:
+        country = info[0]
+        country_iso2 = info[1]
+
+    cog = parse_ais_angle_deg(
+        _first(raw.get("cog"), raw.get("COG"), raw.get("Cog"), raw.get("course"))
+    )
+    true_heading = parse_ais_angle_deg(
+        _first(raw.get("true_heading"), raw.get("TrueHeading"), raw.get("heading"), raw.get("hdg"))
+    )
+
+    return VesselRecord(
+        mmsi=str(mmsi),
+        lat=lat_f,
+        lon=lon_f,
+        ts=ts,
+        name=name,
+        callsign=callsign,
+        country=country,
+        country_iso2=country_iso2,
+        cog=cog,
+        true_heading=true_heading,
+    )
 
 
 def extract_records(payload: Any) -> List[Dict[str, Any]]:
@@ -255,7 +325,13 @@ def ensure_core_schema(conn: PGConnection) -> None:
             """
             ALTER TABLE vessels
             ADD COLUMN IF NOT EXISTS last_inside BOOLEAN,
-            ADD COLUMN IF NOT EXISTS last_zone_ids INTEGER[];
+            ADD COLUMN IF NOT EXISTS last_zone_ids INTEGER[],
+            ADD COLUMN IF NOT EXISTS country TEXT,
+            ADD COLUMN IF NOT EXISTS callsign TEXT,
+            ADD COLUMN IF NOT EXISTS country_iso2 TEXT,
+            ADD COLUMN IF NOT EXISTS cog DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS true_heading DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS bearing_deg DOUBLE PRECISION;
             """
         )
         cur.execute(
@@ -344,20 +420,46 @@ def process_batch(conn: PGConnection, records: Iterable[VesselRecord]) -> int:
             prev_inside = bool(prev[0]) if prev and prev[0] is not None else False
             prev_zone_ids = set(prev[1] or []) if prev and prev[1] is not None else set()
 
-            # Upsert into vessels first (vessel_positions has FK to vessels)
+            country = rec.country
+            country_iso2 = rec.country_iso2
+            info = mmsi_to_country(rec.mmsi)
+            if info:
+                if not country:
+                    country = info[0]
+                if not country_iso2:
+                    country_iso2 = info[1]
+
             cur.execute(
                 """
-                INSERT INTO vessels (mmsi, name, last_lat, last_lon, last_ts, last_inside, last_zone_ids)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO vessels (mmsi, name, last_lat, last_lon, last_ts, last_inside, last_zone_ids, country, country_iso2, callsign, cog, true_heading)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (mmsi) DO UPDATE SET
                     name = COALESCE(EXCLUDED.name, vessels.name),
                     last_lat = EXCLUDED.last_lat,
                     last_lon = EXCLUDED.last_lon,
                     last_ts = EXCLUDED.last_ts,
                     last_inside = EXCLUDED.last_inside,
-                    last_zone_ids = EXCLUDED.last_zone_ids;
+                    last_zone_ids = EXCLUDED.last_zone_ids,
+                    country = COALESCE(EXCLUDED.country, vessels.country),
+                    country_iso2 = COALESCE(EXCLUDED.country_iso2, vessels.country_iso2),
+                    callsign = COALESCE(EXCLUDED.callsign, vessels.callsign),
+                    cog = COALESCE(EXCLUDED.cog, vessels.cog),
+                    true_heading = COALESCE(EXCLUDED.true_heading, vessels.true_heading);
                 """,
-                (rec.mmsi, rec.name or rec.mmsi, rec.lat, rec.lon, rec.ts, inside_now, zone_ids or None),
+                (
+                    rec.mmsi,
+                    rec.name or rec.mmsi,
+                    rec.lat,
+                    rec.lon,
+                    rec.ts,
+                    inside_now,
+                    zone_ids or None,
+                    country,
+                    country_iso2,
+                    rec.callsign,
+                    rec.cog,
+                    rec.true_heading,
+                ),
             )
 
             # Insert historical position
@@ -367,6 +469,33 @@ def process_batch(conn: PGConnection, records: Iterable[VesselRecord]) -> int:
                 VALUES (%s, %s, %s, %s, {point_sql})
                 """,
                 (rec.mmsi, rec.ts, rec.lat, rec.lon, rec.lon, rec.lat),
+            )
+
+            # Bearing for map: COG > true heading > bearing from last two positions
+            bearing_deg: Optional[float] = None
+            if rec.cog is not None:
+                bearing_deg = rec.cog
+            elif rec.true_heading is not None:
+                bearing_deg = rec.true_heading
+            else:
+                cur.execute(
+                    """
+                    SELECT lat, lon FROM vessel_positions
+                    WHERE mmsi = %s
+                    ORDER BY ts DESC
+                    LIMIT 2
+                    """,
+                    (rec.mmsi,),
+                )
+                pos_rows = cur.fetchall()
+                if len(pos_rows) >= 2:
+                    lat_new, lon_new = float(pos_rows[0][0]), float(pos_rows[0][1])
+                    lat_old, lon_old = float(pos_rows[1][0]), float(pos_rows[1][1])
+                    bearing_deg = bearing_deg_lonlat(lon_old, lat_old, lon_new, lat_new)
+
+            cur.execute(
+                "UPDATE vessels SET bearing_deg = %s WHERE mmsi = %s",
+                (bearing_deg, rec.mmsi),
             )
 
             # Entry-only violation detection: outside -> inside transition

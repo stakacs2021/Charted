@@ -22,7 +22,8 @@ _backend = Path(__file__).resolve().parent.parent
 if str(_backend) not in sys.path:
     sys.path.insert(0, str(_backend))
 from database import DATABASE_URL
-from scripts.ingest_ais import VesselRecord, ensure_core_schema, process_batch
+from mmsi_mid import mmsi_to_country
+from scripts.ingest_ais import VesselRecord, ensure_core_schema, parse_ais_angle_deg, process_batch
 
 # California coast bounding box (same as other ingest)
 # Format: [[[lat1, lon1], [lat2, lon2]]]
@@ -51,9 +52,11 @@ def message_to_record(msg: dict) -> VesselRecord | None:
     lat = meta.get("latitude") or meta.get("Latitude")
     lon = meta.get("longitude") or meta.get("Longitude")
     mmsi = meta.get("MMSI")
-    if mmsi is None and "Message" in msg:
-        pr = msg["Message"].get("PositionReport") or msg["Message"].get("ExtendedClassBPositionReport") or msg["Message"].get("StandardClassBPositionReport")
-        if pr is not None:
+    pr = None
+    if "Message" in msg:
+        m = msg["Message"]
+        pr = m.get("PositionReport") or m.get("ExtendedClassBPositionReport") or m.get("StandardClassBPositionReport")
+        if mmsi is None and pr is not None:
             lat = lat or pr.get("Latitude")
             lon = lon or pr.get("Longitude")
             mmsi = mmsi or pr.get("UserID")
@@ -65,8 +68,33 @@ def message_to_record(msg: dict) -> VesselRecord | None:
     except (TypeError, ValueError):
         return None
     name = meta.get("ShipName") or meta.get("shipname")
+    callsign = meta.get("CallSign") or meta.get("Callsign") or meta.get("callSign")
     ts = _parse_aisstream_time(meta.get("time_utc") or "")
-    return VesselRecord(mmsi=str(mmsi), lat=lat_f, lon=lon_f, ts=ts, name=name)
+    country = None
+    country_iso2 = None
+    info = mmsi_to_country(str(mmsi))
+    if info:
+        country = info[0]
+        country_iso2 = info[1]
+
+    cog = None
+    true_heading = None
+    if pr is not None:
+        cog = parse_ais_angle_deg(pr.get("Cog"))
+        true_heading = parse_ais_angle_deg(pr.get("TrueHeading"))
+
+    return VesselRecord(
+        mmsi=str(mmsi),
+        lat=lat_f,
+        lon=lon_f,
+        ts=ts,
+        name=name,
+        callsign=callsign,
+        country=country,
+        country_iso2=country_iso2,
+        cog=cog,
+        true_heading=true_heading,
+    )
 
 
 async def run_stream(api_key: str):

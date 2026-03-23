@@ -32,7 +32,13 @@ def ensure_extended_schema():
             """
             ALTER TABLE vessels
             ADD COLUMN IF NOT EXISTS last_inside BOOLEAN,
-            ADD COLUMN IF NOT EXISTS last_zone_ids INTEGER[];
+            ADD COLUMN IF NOT EXISTS last_zone_ids INTEGER[],
+            ADD COLUMN IF NOT EXISTS country TEXT,
+            ADD COLUMN IF NOT EXISTS callsign TEXT,
+            ADD COLUMN IF NOT EXISTS country_iso2 TEXT,
+            ADD COLUMN IF NOT EXISTS cog DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS true_heading DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS bearing_deg DOUBLE PRECISION;
             """
         )
         cur.execute(
@@ -341,7 +347,8 @@ def vessels_live(
         if include_zones:
             cur.execute(
                 """
-                SELECT v.mmsi, v.name, v.last_lat, v.last_lon, v.last_ts,
+                SELECT v.mmsi, v.name, v.country, v.country_iso2, v.callsign, v.cog, v.true_heading, v.bearing_deg,
+                       v.last_lat, v.last_lon, v.last_ts,
                        COALESCE((
                            SELECT array_agg(z.id ORDER BY z.id)
                            FROM zones z
@@ -362,6 +369,12 @@ def vessels_live(
                 {
                     "mmsi": r["mmsi"],
                     "name": r["name"],
+                    "country": r["country"],
+                    "country_iso2": r["country_iso2"],
+                    "callsign": r["callsign"],
+                    "cog": r["cog"],
+                    "true_heading": r["true_heading"],
+                    "bearing_deg": r["bearing_deg"],
                     "lat": r["last_lat"],
                     "lon": r["last_lon"],
                     "last_ts": r["last_ts"],
@@ -374,7 +387,8 @@ def vessels_live(
 
         cur.execute(
             """
-            SELECT v.mmsi, v.name, v.last_lat, v.last_lon, v.last_ts,
+            SELECT v.mmsi, v.name, v.country, v.country_iso2, v.callsign, v.cog, v.true_heading, v.bearing_deg,
+                   v.last_lat, v.last_lon, v.last_ts,
                    EXISTS(
                        SELECT 1
                        FROM zones z
@@ -396,6 +410,12 @@ def vessels_live(
         {
             "mmsi": r["mmsi"],
             "name": r["name"],
+            "country": r["country"],
+            "country_iso2": r["country_iso2"],
+            "callsign": r["callsign"],
+            "cog": r["cog"],
+            "true_heading": r["true_heading"],
+            "bearing_deg": r["bearing_deg"],
             "lat": r["last_lat"],
             "lon": r["last_lon"],
             "last_ts": r["last_ts"],
@@ -403,6 +423,42 @@ def vessels_live(
             "has_mpa_violations": bool(r["has_mpa_violations"]),
         }
         for r in rows
+    ]
+
+
+@app.get("/vessels/leaderboard")
+def vessels_leaderboard(
+    limit: int = Query(50, ge=1, le=200, description="Max vessels to return"),
+):
+    """Top violators by MPA entry count (leaderboard)."""
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT v.mmsi, v.name, v.country, v.country_iso2, v.callsign,
+                   COUNT(mv.id)::int AS violation_count,
+                   MAX(mv.entry_ts) AS last_violation_ts
+            FROM vessels v
+            JOIN mpa_violations mv ON mv.mmsi = v.mmsi
+            GROUP BY v.mmsi, v.name, v.country, v.country_iso2, v.callsign
+            ORDER BY violation_count DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "rank": i + 1,
+            "mmsi": r["mmsi"],
+            "name": r["name"],
+            "country": r["country"],
+            "country_iso2": r["country_iso2"],
+            "callsign": r["callsign"],
+            "violation_count": r["violation_count"],
+            "last_violation_ts": r["last_violation_ts"],
+        }
+        for i, r in enumerate(rows)
     ]
 
 

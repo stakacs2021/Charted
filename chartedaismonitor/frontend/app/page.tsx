@@ -6,7 +6,8 @@ export default function Home() {
       <h1>AIS MPA Monitor</h1>
       <p>Monitor vessel locations near the California coast and Marine Protected Areas.</p>
       <p>
-        <Link href="/map" style={{ color: "#0066cc" }}>View map (California MPAs)</Link>
+        <Link href="/map" style={{ color: "#0066cc", marginRight: "1.5rem" }}>View map (California MPAs)</Link>
+        <Link href="/leaderboard" style={{ color: "#0066cc" }}>View MPA violations leaderboard</Link>
       </p>
     </main>
   );
