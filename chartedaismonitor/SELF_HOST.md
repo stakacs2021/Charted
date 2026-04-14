@@ -89,7 +89,7 @@ Use this when you want clients to open `http://YOUR_LAN_IP/` only (no `:3000` / 
    cp deploy/docker-compose.override.nginx.example.yml docker-compose.override.yml
    docker compose up -d --build
    ```
-2. Set **`NEXT_PUBLIC_API_URL=http://YOUR_LAN_IP/api`** (no trailing slash), then rebuild the frontend:
+2. Set **`NEXT_PUBLIC_API_URL=/api`** (no trailing slash), then rebuild the frontend:
    ```bash
    docker compose build --no-cache frontend && docker compose up -d frontend
    ```
@@ -110,6 +110,8 @@ With DNS pointing at your server:
 sudo apt install certbot python3-certbot-nginx
 sudo certbot --nginx -d yourdomain.com
 ```
+
+If you prefer a pre-made TLS site template in this repo, copy [`deploy/nginx-aismonitor-tls.conf`](deploy/nginx-aismonitor-tls.conf) into `/etc/nginx/sites-available/chartedaismonitor`, replace `yourdomain.com`, then run certbot.
 
 For LAN-only or raw IP, skip TLS or use a self-signed cert (browsers will warn).
 

@@ -3,11 +3,14 @@ AIS MPA Monitor API: zones (MPAs) and vessel-in-zone checks.
 """
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
+import asyncio
+import json
 
 from database import get_cursor
+from zone_classification import classify_bracket
 
 app = FastAPI(title="AIS MPA Monitor")
 
@@ -168,6 +171,7 @@ def get_zones():
 
     features = []
     for r in rows:
+        bracket = classify_bracket(designation=r["designation"], zone_id=r["id"], name=r["name"])
         features.append({
             "type": "Feature",
             "id": r["id"],
@@ -176,6 +180,8 @@ def get_zones():
                 "name": r["name"],
                 "designation": r["designation"],
                 "source": r["source"],
+                "bracket_class": bracket.bracket_class,
+                "bracket_source": bracket.bracket_source,
             },
             "geometry": r["geom_json"],
         })
@@ -233,6 +239,7 @@ def zones_with_stats():
 
     features = []
     for r in rows:
+        bracket = classify_bracket(designation=r["designation"], zone_id=r["id"], name=r["name"])
         features.append(
             {
                 "type": "Feature",
@@ -243,6 +250,8 @@ def zones_with_stats():
                     "designation": r["designation"],
                     "source": r["source"],
                     "violation_count": r["violation_count"],
+                    "bracket_class": bracket.bracket_class,
+                    "bracket_source": bracket.bracket_source,
                 },
                 "geometry": r["geom_json"],
             }
@@ -530,3 +539,123 @@ def vessel_inside(mmsi: str):
         "inside": len(matched) > 0,
         "matched_zones": matched,
     }
+
+
+# ---------- Feature 4: ingest-runtime history timeline (MPA entry events) ----------
+
+@app.get("/history/mpa-entries")
+def history_mpa_entries(
+    limit: int = Query(100, ge=1, le=1000, description="Max entries to return"),
+    since_ts: Optional[str] = Query(None, description="Only include entries on/after this timestamp (ISO-8601)"),
+):
+    """
+    Recent MPA entry events (mpa_violations rows), newest-first.
+
+    `since_ts` is treated as a timestamp string and passed to Postgres for parsing.
+    """
+    with get_cursor() as cur:
+        if since_ts:
+            cur.execute(
+                """
+                SELECT mv.id AS violation_id,
+                       mv.mmsi,
+                       mv.zone_id,
+                       z.name AS zone_name,
+                       mv.entry_ts,
+                       mv.source
+                FROM mpa_violations mv
+                JOIN zones z ON z.id = mv.zone_id
+                WHERE mv.entry_ts >= %s::timestamptz
+                ORDER BY mv.entry_ts DESC
+                LIMIT %s
+                """,
+                (since_ts, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT mv.id AS violation_id,
+                       mv.mmsi,
+                       mv.zone_id,
+                       z.name AS zone_name,
+                       mv.entry_ts,
+                       mv.source
+                FROM mpa_violations mv
+                JOIN zones z ON z.id = mv.zone_id
+                ORDER BY mv.entry_ts DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "violation_id": r["violation_id"],
+            "mmsi": r["mmsi"],
+            "zone_id": r["zone_id"],
+            "zone_name": r["zone_name"],
+            "entry_ts": r["entry_ts"],
+            "source": r["source"],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/events/mpa-entries")
+async def events_mpa_entries(
+    after_id: int = Query(0, ge=0, description="Only stream entries with id > after_id"),
+    poll_ms: int = Query(1000, ge=250, le=5000, description="DB poll interval (milliseconds)"),
+):
+    """Server-Sent Events stream of new MPA entry events while ingest is running."""
+
+    async def gen():
+        last_id = after_id
+        # Tell proxies and clients not to buffer.
+        yield "retry: 2000\n"
+        while True:
+            events = []
+            with get_cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT mv.id AS violation_id,
+                           mv.mmsi,
+                           mv.zone_id,
+                           z.name AS zone_name,
+                           mv.entry_ts,
+                           mv.source
+                    FROM mpa_violations mv
+                    JOIN zones z ON z.id = mv.zone_id
+                    WHERE mv.id > %s
+                    ORDER BY mv.id ASC
+                    LIMIT 200
+                    """,
+                    (last_id,),
+                )
+                rows = cur.fetchall()
+
+            for r in rows:
+                ev = {
+                    "violation_id": r["violation_id"],
+                    "mmsi": r["mmsi"],
+                    "zone_id": r["zone_id"],
+                    "zone_name": r["zone_name"],
+                    "entry_ts": r["entry_ts"],
+                    "source": r["source"],
+                }
+                events.append(ev)
+                last_id = max(last_id, int(r["violation_id"]))
+
+            for ev in events:
+                yield f"data: {json.dumps(ev, default=str)}\n\n"
+
+            await asyncio.sleep(poll_ms / 1000.0)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
