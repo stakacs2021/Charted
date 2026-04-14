@@ -382,6 +382,18 @@ def ensure_core_schema(conn: PGConnection) -> None:
                 ON mpa_violations (mmsi, entry_ts);
             """
         )
+        # Live-editable: skip recording a violation for this (mmsi, zone_id) pair (see README).
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mpa_violation_allowlist (
+                mmsi TEXT NOT NULL,
+                zone_id INTEGER NOT NULL REFERENCES zones (id) ON DELETE CASCADE,
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (mmsi, zone_id)
+            );
+            """
+        )
     conn.commit()
 
 
@@ -501,6 +513,17 @@ def process_batch(conn: PGConnection, records: Iterable[VesselRecord]) -> int:
             # Entry-only violation detection: outside -> inside transition
             if not prev_inside and inside_now:
                 for zid in zone_ids:
+                    cur.execute(
+                        """
+                        SELECT EXISTS(
+                            SELECT 1 FROM mpa_violation_allowlist
+                            WHERE mmsi = %s AND zone_id = %s
+                        )
+                        """,
+                        (rec.mmsi, zid),
+                    )
+                    if cur.fetchone()[0]:
+                        continue
                     cur.execute(
                         """
                         INSERT INTO mpa_violations (mmsi, zone_id, entry_ts, source)

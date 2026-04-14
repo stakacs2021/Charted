@@ -8,6 +8,32 @@ Web app that monitors vessel locations near the California coast and checks whet
 - **Course / heading** — COG and true heading are ingested when present; the map rotates ship icons using **bearing** (COG, else heading, else bearing from the last two stored positions).
 - **Trails** — Optional **MPA violator** trails (red) and optional **all vessels in view** trails (blue, capped at 40 ships per refresh for performance).
 - **Leaderboard** — `/leaderboard` lists top MMSIs by MPA entry count.
+- **Violation allowlist (live)** — Table `mpa_violation_allowlist` holds `(mmsi, zone_id)` pairs where **ingest will not insert** an `mpa_violations` row on entry. Edit with SQL anytime; changes apply on the next AIS position (no app redeploy). See below.
+
+### MPA violation allowlist (no redeploy)
+
+Zones still render on the map; only **violation recording** is skipped for matching pairs.
+
+1. Find a zone id (e.g. from `/zones` GeoJSON `properties.id` or `/debug/stats`).
+2. Insert or delete rows:
+
+```sql
+-- Allow MMSI 123456789 to enter zone 42 without recording a violation
+INSERT INTO mpa_violation_allowlist (mmsi, zone_id, note)
+VALUES ('123456789', 42, 'Charter permit')
+ON CONFLICT (mmsi, zone_id) DO UPDATE SET note = EXCLUDED.note;
+
+-- Remove the exception
+DELETE FROM mpa_violation_allowlist WHERE mmsi = '123456789' AND zone_id = 42;
+```
+
+From Docker (host shell):
+
+```bash
+docker compose exec db psql -U ais_user -d ais -c "SELECT * FROM mpa_violation_allowlist ORDER BY zone_id, mmsi;"
+```
+
+The ingest script creates this table if missing (`ensure_core_schema` / API startup). Existing databases get the table on the next **backend** or **ingest** run after upgrade.
 
 ### Docs
 

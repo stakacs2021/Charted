@@ -63,3 +63,12 @@ CREATE INDEX IF NOT EXISTS idx_mpa_violations_zone_entry
 
 CREATE INDEX IF NOT EXISTS idx_mpa_violations_mmsi_entry
     ON mpa_violations (mmsi, entry_ts);
+
+-- Optional: per-(mmsi, zone) allowlist — ingest skips inserting mpa_violations for these pairs (editable live via SQL).
+CREATE TABLE IF NOT EXISTS mpa_violation_allowlist (
+    mmsi TEXT NOT NULL,
+    zone_id INTEGER NOT NULL REFERENCES zones (id) ON DELETE CASCADE,
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (mmsi, zone_id)
+);
