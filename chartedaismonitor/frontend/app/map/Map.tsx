@@ -71,7 +71,19 @@ export default function Map() {
   const [mpaEntryEvents, setMpaEntryEvents] = useState<MpaEntryEvent[]>([]);
   const [mpaTimelineError, setMpaTimelineError] = useState<string | null>(null);
 
-  const clampInt = (n: number, min: number, max: number) => Math.min(max, Math.max(min, Math.trunc(n)));
+  /** Never return NaN — `type="number"` + `value={NaN}` triggers "string did not match the expected pattern." */
+  const clampInt = (n: number, min: number, max: number) => {
+    if (!Number.isFinite(n)) return min;
+    return Math.min(max, Math.max(min, Math.trunc(n)));
+  };
+
+  const parseTrailInt = (raw: string, min: number, max: number, prev: number) => {
+    const t = raw.trim();
+    if (t === "" || t === "-") return prev;
+    const n = Number(t);
+    if (!Number.isFinite(n)) return prev;
+    return clampInt(n, min, max);
+  };
 
   useEffect(() => {
     fetch(`${API_URL}/zones`)
@@ -671,8 +683,10 @@ export default function Map() {
               type="number"
               min={1}
               max={72}
-              value={violatorTrailHours}
-              onChange={(e) => setViolatorTrailHours(clampInt(Number(e.target.value), 1, 72))}
+              value={Number.isFinite(violatorTrailHours) ? violatorTrailHours : 6}
+              onChange={(e) =>
+                setViolatorTrailHours((prev) => parseTrailInt(e.target.value, 1, 72, Number.isFinite(prev) ? prev : 6))
+              }
               style={{ width: 64 }}
             />
           </label>
@@ -682,8 +696,12 @@ export default function Map() {
               type="number"
               min={1}
               max={5000}
-              value={violatorTrailLimit}
-              onChange={(e) => setViolatorTrailLimit(clampInt(Number(e.target.value), 1, 5000))}
+              value={Number.isFinite(violatorTrailLimit) ? violatorTrailLimit : 1000}
+              onChange={(e) =>
+                setViolatorTrailLimit((prev) =>
+                  parseTrailInt(e.target.value, 1, 5000, Number.isFinite(prev) ? prev : 1000)
+                )
+              }
               style={{ width: 86 }}
             />
           </label>
@@ -703,8 +721,10 @@ export default function Map() {
               type="number"
               min={1}
               max={72}
-              value={allTrailHours}
-              onChange={(e) => setAllTrailHours(clampInt(Number(e.target.value), 1, 72))}
+              value={Number.isFinite(allTrailHours) ? allTrailHours : 3}
+              onChange={(e) =>
+                setAllTrailHours((prev) => parseTrailInt(e.target.value, 1, 72, Number.isFinite(prev) ? prev : 3))
+              }
               style={{ width: 64 }}
             />
           </label>
@@ -714,8 +734,10 @@ export default function Map() {
               type="number"
               min={1}
               max={5000}
-              value={allTrailLimit}
-              onChange={(e) => setAllTrailLimit(clampInt(Number(e.target.value), 1, 5000))}
+              value={Number.isFinite(allTrailLimit) ? allTrailLimit : 200}
+              onChange={(e) =>
+                setAllTrailLimit((prev) => parseTrailInt(e.target.value, 1, 5000, Number.isFinite(prev) ? prev : 200))
+              }
               style={{ width: 86 }}
             />
           </label>
@@ -729,8 +751,12 @@ export default function Map() {
                 type="number"
                 min={1}
                 max={72}
-                value={selectedTrailHours}
-                onChange={(e) => setSelectedTrailHours(clampInt(Number(e.target.value), 1, 72))}
+                value={Number.isFinite(selectedTrailHours) ? selectedTrailHours : 6}
+                onChange={(e) =>
+                  setSelectedTrailHours((prev) =>
+                    parseTrailInt(e.target.value, 1, 72, Number.isFinite(prev) ? prev : 6)
+                  )
+                }
                 style={{ width: 64 }}
               />
             </label>
@@ -740,8 +766,12 @@ export default function Map() {
                 type="number"
                 min={1}
                 max={5000}
-                value={selectedTrailLimit}
-                onChange={(e) => setSelectedTrailLimit(clampInt(Number(e.target.value), 1, 5000))}
+                value={Number.isFinite(selectedTrailLimit) ? selectedTrailLimit : 2000}
+                onChange={(e) =>
+                  setSelectedTrailLimit((prev) =>
+                    parseTrailInt(e.target.value, 1, 5000, Number.isFinite(prev) ? prev : 2000)
+                  )
+                }
                 style={{ width: 86 }}
               />
             </label>
