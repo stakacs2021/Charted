@@ -42,6 +42,15 @@ type VesselTrailResponse = {
   line: GeoJSON.Feature<GeoJSON.LineString> | null;
 };
 
+type MpaEntryEvent = {
+  violation_id: number;
+  mmsi: string;
+  zone_id: number;
+  zone_name: string;
+  entry_ts: string;
+  source?: string | null;
+};
+
 export default function Map() {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstance = useRef<maplibregl.Map | null>(null);
@@ -53,6 +62,17 @@ export default function Map() {
   const [allVesselTrailsVisible, setAllVesselTrailsVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [allTrailHours, setAllTrailHours] = useState(3);
+  const [allTrailLimit, setAllTrailLimit] = useState(200);
+  const [violatorTrailHours, setViolatorTrailHours] = useState(6);
+  const [violatorTrailLimit, setViolatorTrailLimit] = useState(1000);
+  const [selectedTrailHours, setSelectedTrailHours] = useState(6);
+  const [selectedTrailLimit, setSelectedTrailLimit] = useState(2000);
+  const [mpaEntryEvents, setMpaEntryEvents] = useState<MpaEntryEvent[]>([]);
+  const [mpaTimelineError, setMpaTimelineError] = useState<string | null>(null);
+
+  const clampInt = (n: number, min: number, max: number) => Math.min(max, Math.max(min, Math.trunc(n)));
+
   useEffect(() => {
     fetch(`${API_URL}/zones`)
       .then((r) => {
@@ -61,6 +81,50 @@ export default function Map() {
       })
       .then((data: GeoJSONFC) => setZones(data))
       .catch((e) => setError(e.message));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let es: EventSource | null = null;
+
+    const loadAndSubscribe = async () => {
+      try {
+        setMpaTimelineError(null);
+        const res = await fetch(`${API_URL}/history/mpa-entries?limit=50`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const initial: MpaEntryEvent[] = await res.json();
+        if (cancelled) return;
+        setMpaEntryEvents(initial);
+        const maxId = initial.reduce((m, e) => Math.max(m, Number(e.violation_id) || 0), 0);
+
+        es = new EventSource(`${API_URL}/events/mpa-entries?after_id=${encodeURIComponent(String(maxId))}`);
+        es.onmessage = (evt) => {
+          try {
+            const parsed = JSON.parse(evt.data) as MpaEntryEvent;
+            if (cancelled) return;
+            setMpaEntryEvents((prev) => {
+              const next = [parsed, ...prev];
+              return next.slice(0, 200);
+            });
+          } catch {
+            // ignore malformed event
+          }
+        };
+        es.onerror = () => {
+          if (cancelled) return;
+          setMpaTimelineError("Timeline disconnected (will retry automatically).");
+        };
+      } catch (e: any) {
+        if (cancelled) return;
+        setMpaTimelineError(e?.message || String(e));
+      }
+    };
+
+    loadAndSubscribe();
+    return () => {
+      cancelled = true;
+      if (es) es.close();
+    };
   }, []);
 
   useEffect(() => {
@@ -192,8 +256,6 @@ export default function Map() {
     const allTrailSourceId = "all-vessel-trails";
     const allTrailLayerId = "all-vessel-trails-line";
     const MAX_ALL_VESSEL_TRAILS = 40;
-    const ALL_TRAIL_HOURS = 3;
-    const ALL_TRAIL_LIMIT = 200;
 
     const violatorTrailSourceId = "violator-trails";
     const violatorTrailLayerId = "violator-trails-line";
@@ -305,10 +367,12 @@ export default function Map() {
             .map((v) => v.mmsi)
             .slice(0, MAX_ALL_VESSEL_TRAILS);
           if (allMmsis.length > 0) {
+            const hours = clampInt(allTrailHours, 1, 72);
+            const limit = clampInt(allTrailLimit, 1, 5000);
             const allTrailResponses = await Promise.all(
               allMmsis.map((mmsi) =>
                 fetch(
-                  `${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${ALL_TRAIL_HOURS}&limit=${ALL_TRAIL_LIMIT}`
+                  `${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${hours}&limit=${limit}`
                 ).then((r) => (r.ok ? r.json() : null))
               )
             );
@@ -335,10 +399,12 @@ export default function Map() {
           .map((v) => v.mmsi)
           .slice(0, MAX_VIOLATOR_TRAILS);
         ensureViolatorTrailLayer();
-        if (violatorMmsis.length > 0) {
+        if (violatorMmsis.length > 0 && violatorTrailsVisible) {
+          const hours = clampInt(violatorTrailHours, 1, 72);
+          const limit = clampInt(violatorTrailLimit, 1, 5000);
           const trailResponses = await Promise.all(
             violatorMmsis.map((mmsi) =>
-              fetch(`${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=6&limit=1000`).then((r) =>
+              fetch(`${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${hours}&limit=${limit}`).then((r) =>
                 r.ok ? r.json() : null
               )
             )
@@ -366,7 +432,15 @@ export default function Map() {
 
     const interval = window.setInterval(fetchAndUpdate, 5_000);
     return () => window.clearInterval(interval);
-  }, [mapLoaded, allVesselTrailsVisible]);
+  }, [
+    mapLoaded,
+    allVesselTrailsVisible,
+    violatorTrailsVisible,
+    allTrailHours,
+    allTrailLimit,
+    violatorTrailHours,
+    violatorTrailLimit,
+  ]);
 
   useEffect(() => {
     const map = mapInstance.current;
@@ -477,7 +551,9 @@ export default function Map() {
         try {
           let trailCount = 0;
           if (hasViolations) {
-            const res = await fetch(`${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=6&limit=2000`);
+            const hours = clampInt(selectedTrailHours, 1, 72);
+            const limit = clampInt(selectedTrailLimit, 1, 5000);
+            const res = await fetch(`${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${hours}&limit=${limit}`);
             if (res.ok) {
               const data: VesselTrailResponse = await res.json();
               trailCount = data.count;
@@ -544,7 +620,7 @@ export default function Map() {
       map.off("click", onClick);
       map.off("mousemove", onMouseMove);
     };
-  }, [mapLoaded, zones]);
+  }, [mapLoaded, zones, selectedTrailHours, selectedTrailLimit]);
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
@@ -588,6 +664,30 @@ export default function Map() {
           />
           Show MPA violator trails
         </label>
+        <div style={{ marginTop: 6, marginLeft: 22, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <span style={{ color: "#555", fontSize: 12 }}>Hours</span>
+            <input
+              type="number"
+              min={1}
+              max={72}
+              value={violatorTrailHours}
+              onChange={(e) => setViolatorTrailHours(clampInt(Number(e.target.value), 1, 72))}
+              style={{ width: 64 }}
+            />
+          </label>
+          <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <span style={{ color: "#555", fontSize: 12 }}>Max points</span>
+            <input
+              type="number"
+              min={1}
+              max={5000}
+              value={violatorTrailLimit}
+              onChange={(e) => setViolatorTrailLimit(clampInt(Number(e.target.value), 1, 5000))}
+              style={{ width: 86 }}
+            />
+          </label>
+        </div>
         <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginTop: 8 }}>
           <input
             type="checkbox"
@@ -596,8 +696,97 @@ export default function Map() {
           />
           Show trails (all vessels in view, max 40)
         </label>
+        <div style={{ marginTop: 6, marginLeft: 22, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <span style={{ color: "#555", fontSize: 12 }}>Hours</span>
+            <input
+              type="number"
+              min={1}
+              max={72}
+              value={allTrailHours}
+              onChange={(e) => setAllTrailHours(clampInt(Number(e.target.value), 1, 72))}
+              style={{ width: 64 }}
+            />
+          </label>
+          <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <span style={{ color: "#555", fontSize: 12 }}>Max points</span>
+            <input
+              type="number"
+              min={1}
+              max={5000}
+              value={allTrailLimit}
+              onChange={(e) => setAllTrailLimit(clampInt(Number(e.target.value), 1, 5000))}
+              style={{ width: 86 }}
+            />
+          </label>
+        </div>
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #eee" }}>
+          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6 }}>Selected vessel trail</div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <span style={{ color: "#555", fontSize: 12 }}>Hours</span>
+              <input
+                type="number"
+                min={1}
+                max={72}
+                value={selectedTrailHours}
+                onChange={(e) => setSelectedTrailHours(clampInt(Number(e.target.value), 1, 72))}
+                style={{ width: 64 }}
+              />
+            </label>
+            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <span style={{ color: "#555", fontSize: 12 }}>Max points</span>
+              <input
+                type="number"
+                min={1}
+                max={5000}
+                value={selectedTrailLimit}
+                onChange={(e) => setSelectedTrailLimit(clampInt(Number(e.target.value), 1, 5000))}
+                style={{ width: 86 }}
+              />
+            </label>
+          </div>
+          <div style={{ marginTop: 6, color: "#666", fontSize: 12 }}>Click a vessel to refresh its trail.</div>
+        </div>
         <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
           {zones ? `${zones.features.length} zones` : "Loading…"}
+        </div>
+      </div>
+
+      <div
+        style={{
+          position: "absolute",
+          top: 12,
+          right: 12,
+          width: 340,
+          maxWidth: "calc(100vw - 24px)",
+          background: "white",
+          padding: "10px 14px",
+          borderRadius: 8,
+          boxShadow: "0 1px 4px rgba(0,0,0,0.2)",
+          fontFamily: "system-ui",
+          fontSize: 13,
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>MPA entry timeline (ingest)</div>
+        {mpaTimelineError && <div style={{ color: "#c00", marginBottom: 8 }}>{mpaTimelineError}</div>}
+        <div style={{ maxHeight: 260, overflow: "auto" }}>
+          {mpaEntryEvents.length === 0 ? (
+            <div style={{ color: "#666" }}>No entries yet.</div>
+          ) : (
+            mpaEntryEvents.map((ev) => (
+              <div key={ev.violation_id} style={{ padding: "6px 0", borderTop: "1px solid #eee" }}>
+                <div style={{ fontWeight: 600 }}>
+                  {ev.zone_name} <span style={{ fontWeight: 400, color: "#666" }}>#{ev.zone_id}</span>
+                </div>
+                <div style={{ color: "#333" }}>MMSI: {ev.mmsi}</div>
+                <div style={{ color: "#666", fontSize: 12 }}>
+                  {ev.entry_ts}
+                  {ev.source ? ` · ${ev.source}` : ""}
+                </div>
+              </div>
+            ))
+          )}
         </div>
       </div>
     </div>
