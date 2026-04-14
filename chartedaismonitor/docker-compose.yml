@@ -28,8 +28,9 @@ services:
     environment:
       DATABASE_URL: postgresql://ais_user:${POSTGRES_PASSWORD:-changeme}@db:5432/ais
     ports:
-      # LAN: use http://<server-ip>:8000 — or bind to 127.0.0.1:8000 for Nginx-only (see deploy/)
-      - "8000:8000"
+      # One mapping only (override files merge `ports` by appending — duplicate host ports fail).
+      # Nginx on host: set BACKEND_HOST=127.0.0.1 in .env (see deploy/docker-compose.override.nginx.example.yml)
+      - "${BACKEND_HOST:-0.0.0.0}:${BACKEND_PORT:-8000}:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -62,6 +63,6 @@ services:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${FRONTEND_HOST:-0.0.0.0}:${FRONTEND_PORT:-3000}:3000"
     depends_on:
       - backend

@@ -1,13 +1,16 @@
-# Use when Nginx on the host proxies to frontend (3000) and backend (8000).
-# Only containers should be reachable via localhost; Nginx listens on :80 for LAN.
+# Nginx on the host should proxy to loopback only (not LAN/WAN on :3000 / :8000).
 #
-#   cp deploy/docker-compose.override.nginx.example.yml docker-compose.override.yml
-#   docker compose up -d --build
+# Do NOT duplicate `ports:` here: Compose merges lists by APPENDING. The base
+# `docker-compose.yml` already publishes backend/frontend; adding another
+# `127.0.0.1:8000:8000` line binds host port 8000 twice → "address already in use".
 #
-services:
-  backend:
-    ports:
-      - "127.0.0.1:8000:8000"
-  frontend:
-    ports:
-      - "127.0.0.1:3000:3000"
+# Instead set in `.env` (same directory as docker-compose.yml):
+#   BACKEND_HOST=127.0.0.1
+#   BACKEND_PORT=8000
+#   FRONTEND_HOST=127.0.0.1
+#   FRONTEND_PORT=3000
+#
+# Then: docker compose up -d --build
+#
+# This file can remain unused, or delete `docker-compose.override.yml` if you
+# copied an older version that only repeated `ports:`.

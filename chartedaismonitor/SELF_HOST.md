@@ -84,9 +84,15 @@ Ingest uses the same backend image and connects to `db` on the internal network.
 
 Use this when you want clients to open `http://YOUR_LAN_IP/` only (no `:3000` / `:8000` in the URL).
 
-1. **Bind Compose to loopback** so only Nginx listens on the LAN:
+1. **Bind Compose to loopback** so only Nginx listens on the LAN (do **not** add a second `ports:` block in an override file — Compose merges port lists by **appending**, which would bind `:8000` / `:3000` twice and fail with “address already in use”). Set in **`.env`**:
    ```bash
-   cp deploy/docker-compose.override.nginx.example.yml docker-compose.override.yml
+   BACKEND_HOST=127.0.0.1
+   BACKEND_PORT=8000
+   FRONTEND_HOST=127.0.0.1
+   FRONTEND_PORT=3000
+   ```
+   If you previously copied `deploy/docker-compose.override.nginx.example.yml` to `docker-compose.override.yml`, remove that file or delete any `ports:` entries from it, then:
+   ```bash
    docker compose up -d --build
    ```
 2. Set **`NEXT_PUBLIC_API_URL=/api`** (no trailing slash), then rebuild the frontend:
