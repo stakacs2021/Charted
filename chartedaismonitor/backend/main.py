@@ -41,7 +41,16 @@ def ensure_extended_schema():
             ADD COLUMN IF NOT EXISTS country_iso2 TEXT,
             ADD COLUMN IF NOT EXISTS cog DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS true_heading DOUBLE PRECISION,
-            ADD COLUMN IF NOT EXISTS bearing_deg DOUBLE PRECISION;
+            ADD COLUMN IF NOT EXISTS bearing_deg DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS ais_ship_type_code INTEGER,
+            ADD COLUMN IF NOT EXISTS vessel_type TEXT;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE zones
+            ADD COLUMN IF NOT EXISTS bracket_class TEXT,
+            ADD COLUMN IF NOT EXISTS bracket_source TEXT;
             """
         )
         cur.execute(
@@ -91,6 +100,106 @@ def ensure_extended_schema():
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS zone_vessel_type_policy (
+                zone_bracket_class TEXT NOT NULL,
+                vessel_type TEXT NOT NULL,
+                allowed BOOLEAN NOT NULL,
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (zone_bracket_class, vessel_type)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE OR REPLACE FUNCTION is_vessel_allowed_in_zone(p_mmsi TEXT, p_zone_id INTEGER)
+            RETURNS BOOLEAN
+            LANGUAGE plpgsql
+            AS $$
+            DECLARE
+                v_allowed BOOLEAN;
+                v_vessel_type TEXT;
+                v_bracket TEXT;
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM mpa_violation_allowlist
+                    WHERE mmsi = p_mmsi AND zone_id = p_zone_id
+                ) THEN
+                    RETURN TRUE;
+                END IF;
+
+                SELECT vessel_type INTO v_vessel_type
+                FROM vessels
+                WHERE mmsi = p_mmsi;
+
+                SELECT bracket_class INTO v_bracket
+                FROM zones
+                WHERE id = p_zone_id;
+
+                IF v_vessel_type IS NULL OR v_bracket IS NULL THEN
+                    RETURN FALSE;
+                END IF;
+
+                SELECT allowed INTO v_allowed
+                FROM zone_vessel_type_policy
+                WHERE zone_bracket_class = v_bracket
+                  AND vessel_type = v_vessel_type;
+
+                RETURN COALESCE(v_allowed, FALSE);
+            END;
+            $$;
+            """
+        )
+        cur.execute(
+            """
+            CREATE OR REPLACE FUNCTION mpa_violations_enforce_vessel_type_policy()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                IF is_vessel_allowed_in_zone(NEW.mmsi, NEW.zone_id) THEN
+                    RETURN NULL;
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+            """
+        )
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_trigger WHERE tgname = 'trg_mpa_violations_policy'
+                ) THEN
+                    CREATE TRIGGER trg_mpa_violations_policy
+                    BEFORE INSERT ON mpa_violations
+                    FOR EACH ROW
+                    EXECUTE FUNCTION mpa_violations_enforce_vessel_type_policy();
+                END IF;
+            END
+            $$;
+            """
+        )
+
+        # Backfill bracket_class/bracket_source for existing zones (idempotent)
+        cur.execute(
+            "SELECT id, name, designation FROM zones WHERE bracket_class IS NULL OR bracket_source IS NULL"
+        )
+        zone_rows = cur.fetchall()
+        for r in zone_rows:
+            bracket = classify_bracket(designation=r["designation"], zone_id=r["id"], name=r["name"])
+            cur.execute(
+                """
+                UPDATE zones
+                SET bracket_class = %s,
+                    bracket_source = %s
+                WHERE id = %s
+                """,
+                (bracket.bracket_class, bracket.bracket_source, r["id"]),
+            )
 
 
 @app.get("/")
@@ -446,6 +555,131 @@ def vessels_live(
     ]
 
 
+@app.get("/vessels/asof")
+def vessels_asof(
+    ts: str = Query(..., description="As-of timestamp (ISO-8601)"),
+    min_lat: float = Query(32.0, description="Bounding box min latitude"),
+    min_lon: float = Query(-125.0, description="Bounding box min longitude"),
+    max_lat: float = Query(42.5, description="Bounding box max latitude"),
+    max_lon: float = Query(-114.0, description="Bounding box max longitude"),
+    limit: int = Query(200, ge=1, le=5000, description="Max vessels to return"),
+    include_zones: bool = Query(False, description="Include matched zone ids per vessel"),
+):
+    """
+    Historical vessel snapshots as-of a timestamp.
+
+    Uses vessel_positions history to pick the last known position per vessel at/before `ts`.
+    Note: metadata (name/country/type) comes from `vessels` (latest-known), while position comes from history.
+    """
+    with get_cursor() as cur:
+        if include_zones:
+            cur.execute(
+                """
+                WITH last_pos AS (
+                    SELECT DISTINCT ON (vp.mmsi)
+                           vp.mmsi, vp.ts AS last_ts, vp.lat AS last_lat, vp.lon AS last_lon
+                    FROM vessel_positions vp
+                    WHERE vp.ts <= %s::timestamptz
+                    ORDER BY vp.mmsi, vp.ts DESC
+                )
+                SELECT v.mmsi, v.name, v.country, v.country_iso2, v.callsign, v.cog, v.true_heading, v.bearing_deg,
+                       v.ais_ship_type_code, v.vessel_type,
+                       lp.last_lat, lp.last_lon, lp.last_ts,
+                       COALESCE((
+                           SELECT array_agg(z.id ORDER BY z.id)
+                           FROM zones z
+                           WHERE ST_Intersects(z.geom, ST_SetSRID(ST_MakePoint(lp.last_lon, lp.last_lat), 4326))
+                       ), ARRAY[]::int[]) AS matched_zone_ids,
+                       EXISTS(
+                           SELECT 1 FROM mpa_violations mv
+                           WHERE mv.mmsi = v.mmsi AND mv.entry_ts <= %s::timestamptz
+                       ) AS has_mpa_violations
+                FROM last_pos lp
+                JOIN vessels v ON v.mmsi = lp.mmsi
+                WHERE lp.last_lat BETWEEN %s AND %s
+                  AND lp.last_lon BETWEEN %s AND %s
+                ORDER BY lp.last_ts DESC NULLS LAST
+                LIMIT %s
+                """,
+                (ts, ts, min_lat, max_lat, min_lon, max_lon, limit),
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    "mmsi": r["mmsi"],
+                    "name": r["name"],
+                    "country": r["country"],
+                    "country_iso2": r["country_iso2"],
+                    "callsign": r["callsign"],
+                    "cog": r["cog"],
+                    "true_heading": r["true_heading"],
+                    "bearing_deg": r["bearing_deg"],
+                    "ais_ship_type_code": r["ais_ship_type_code"],
+                    "vessel_type": r["vessel_type"],
+                    "lat": r["last_lat"],
+                    "lon": r["last_lon"],
+                    "last_ts": r["last_ts"],
+                    "inside_any_mpa": len(r["matched_zone_ids"]) > 0,
+                    "matched_zone_ids": r["matched_zone_ids"],
+                    "has_mpa_violations": bool(r["has_mpa_violations"]),
+                }
+                for r in rows
+            ]
+
+        cur.execute(
+            """
+            WITH last_pos AS (
+                SELECT DISTINCT ON (vp.mmsi)
+                       vp.mmsi, vp.ts AS last_ts, vp.lat AS last_lat, vp.lon AS last_lon
+                FROM vessel_positions vp
+                WHERE vp.ts <= %s::timestamptz
+                ORDER BY vp.mmsi, vp.ts DESC
+            )
+            SELECT v.mmsi, v.name, v.country, v.country_iso2, v.callsign, v.cog, v.true_heading, v.bearing_deg,
+                   v.ais_ship_type_code, v.vessel_type,
+                   lp.last_lat, lp.last_lon, lp.last_ts,
+                   EXISTS(
+                       SELECT 1
+                       FROM zones z
+                       WHERE ST_Intersects(z.geom, ST_SetSRID(ST_MakePoint(lp.last_lon, lp.last_lat), 4326))
+                   ) AS inside_any_mpa,
+                   EXISTS(
+                       SELECT 1 FROM mpa_violations mv
+                       WHERE mv.mmsi = v.mmsi AND mv.entry_ts <= %s::timestamptz
+                   ) AS has_mpa_violations
+            FROM last_pos lp
+            JOIN vessels v ON v.mmsi = lp.mmsi
+            WHERE lp.last_lat BETWEEN %s AND %s
+              AND lp.last_lon BETWEEN %s AND %s
+            ORDER BY lp.last_ts DESC NULLS LAST
+            LIMIT %s
+            """,
+            (ts, ts, min_lat, max_lat, min_lon, max_lon, limit),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "mmsi": r["mmsi"],
+            "name": r["name"],
+            "country": r["country"],
+            "country_iso2": r["country_iso2"],
+            "callsign": r["callsign"],
+            "cog": r["cog"],
+            "true_heading": r["true_heading"],
+            "bearing_deg": r["bearing_deg"],
+            "ais_ship_type_code": r["ais_ship_type_code"],
+            "vessel_type": r["vessel_type"],
+            "lat": r["last_lat"],
+            "lon": r["last_lon"],
+            "last_ts": r["last_ts"],
+            "inside_any_mpa": bool(r["inside_any_mpa"]),
+            "has_mpa_violations": bool(r["has_mpa_violations"]),
+        }
+        for r in rows
+    ]
+
+
 @app.get("/vessels/leaderboard")
 def vessels_leaderboard(
     limit: int = Query(50, ge=1, le=200, description="Max vessels to return"),
@@ -487,20 +721,43 @@ def vessel_trail(
     mmsi: str,
     hours: int = Query(6, ge=1, le=72, description="How many hours of trail to return"),
     limit: int = Query(1000, ge=1, le=5000, description="Max positions to return"),
+    end_ts: Optional[str] = Query(None, description="Trail end timestamp (ISO-8601). Defaults to now()"),
 ):
     """Short-term vessel trail from historical positions (for dotted path rendering)."""
     with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT ts, lat, lon
-            FROM vessel_positions
-            WHERE mmsi = %s
-              AND ts >= NOW() - (%s * INTERVAL '1 hour')
-            ORDER BY ts ASC
-            LIMIT %s
-            """,
-            (mmsi, hours, limit),
-        )
+        if end_ts:
+            cur.execute(
+                """
+                SELECT ts, lat, lon
+                FROM (
+                    SELECT ts, lat, lon
+                    FROM vessel_positions
+                    WHERE mmsi = %s
+                      AND ts <= %s::timestamptz
+                      AND ts >= (%s::timestamptz - (%s * INTERVAL '1 hour'))
+                    ORDER BY ts DESC
+                    LIMIT %s
+                ) t
+                ORDER BY ts ASC
+                """,
+                (mmsi, end_ts, end_ts, hours, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT ts, lat, lon
+                FROM (
+                    SELECT ts, lat, lon
+                    FROM vessel_positions
+                    WHERE mmsi = %s
+                      AND ts >= NOW() - (%s * INTERVAL '1 hour')
+                    ORDER BY ts DESC
+                    LIMIT %s
+                ) t
+                ORDER BY ts ASC
+                """,
+                (mmsi, hours, limit),
+            )
         rows = cur.fetchall()
 
     positions = [{"ts": r["ts"], "lat": r["lat"], "lon": r["lon"]} for r in rows]
@@ -598,6 +855,46 @@ def history_mpa_entries(
                 """,
                 (limit,),
             )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "violation_id": r["violation_id"],
+            "mmsi": r["mmsi"],
+            "zone_id": r["zone_id"],
+            "zone_name": r["zone_name"],
+            "entry_ts": r["entry_ts"],
+            "source": r["source"],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/history/mpa-entries/window")
+def history_mpa_entries_window(
+    start_ts: str = Query(..., description="Window start timestamp (ISO-8601)"),
+    end_ts: str = Query(..., description="Window end timestamp (ISO-8601)"),
+    limit: int = Query(1000, ge=1, le=5000, description="Max entries to return"),
+):
+    """MPA entry events within [start_ts, end_ts], newest-first."""
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT mv.id AS violation_id,
+                   mv.mmsi,
+                   mv.zone_id,
+                   z.name AS zone_name,
+                   mv.entry_ts,
+                   mv.source
+            FROM mpa_violations mv
+            JOIN zones z ON z.id = mv.zone_id
+            WHERE mv.entry_ts >= %s::timestamptz
+              AND mv.entry_ts <= %s::timestamptz
+            ORDER BY mv.entry_ts DESC
+            LIMIT %s
+            """,
+            (start_ts, end_ts, limit),
+        )
         rows = cur.fetchall()
 
     return [

@@ -70,6 +70,21 @@ export default function Map() {
   const [selectedTrailLimit, setSelectedTrailLimit] = useState(2000);
   const [mpaEntryEvents, setMpaEntryEvents] = useState<MpaEntryEvent[]>([]);
   const [mpaTimelineError, setMpaTimelineError] = useState<string | null>(null);
+  const [historicalMode, setHistoricalMode] = useState(false);
+  const [historicalTsLocal, setHistoricalTsLocal] = useState<string>(() => {
+    const d = new Date();
+    d.setSeconds(0, 0);
+    // datetime-local expects "YYYY-MM-DDTHH:mm" in local time
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  });
+
+  const historicalIso = (() => {
+    if (!historicalTsLocal) return null;
+    const d = new Date(historicalTsLocal);
+    if (!Number.isFinite(d.getTime())) return null;
+    return d.toISOString();
+  })();
 
   /** Never return NaN — `type="number"` + `value={NaN}` triggers "string did not match the expected pattern." */
   const clampInt = (n: number, min: number, max: number) => {
@@ -102,30 +117,45 @@ export default function Map() {
     const loadAndSubscribe = async () => {
       try {
         setMpaTimelineError(null);
-        const res = await fetch(`${API_URL}/history/mpa-entries?limit=50`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const initial: MpaEntryEvent[] = await res.json();
-        if (cancelled) return;
-        setMpaEntryEvents(initial);
-        const maxId = initial.reduce((m, e) => Math.max(m, Number(e.violation_id) || 0), 0);
-
-        es = new EventSource(`${API_URL}/events/mpa-entries?after_id=${encodeURIComponent(String(maxId))}`);
-        es.onmessage = (evt) => {
-          try {
-            const parsed = JSON.parse(evt.data) as MpaEntryEvent;
-            if (cancelled) return;
-            setMpaEntryEvents((prev) => {
-              const next = [parsed, ...prev];
-              return next.slice(0, 200);
-            });
-          } catch {
-            // ignore malformed event
-          }
-        };
-        es.onerror = () => {
+        if (historicalMode) {
+          if (!historicalIso) throw new Error("Invalid historical timestamp.");
+          const end = new Date(historicalIso);
+          const start = new Date(end.getTime() - 60 * 60 * 1000);
+          const res = await fetch(
+            `${API_URL}/history/mpa-entries/window?start_ts=${encodeURIComponent(
+              start.toISOString()
+            )}&end_ts=${encodeURIComponent(end.toISOString())}&limit=200`
+          );
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const initial: MpaEntryEvent[] = await res.json();
           if (cancelled) return;
-          setMpaTimelineError("Timeline disconnected (will retry automatically).");
-        };
+          setMpaEntryEvents(initial);
+        } else {
+          const res = await fetch(`${API_URL}/history/mpa-entries?limit=50`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const initial: MpaEntryEvent[] = await res.json();
+          if (cancelled) return;
+          setMpaEntryEvents(initial);
+          const maxId = initial.reduce((m, e) => Math.max(m, Number(e.violation_id) || 0), 0);
+
+          es = new EventSource(`${API_URL}/events/mpa-entries?after_id=${encodeURIComponent(String(maxId))}`);
+          es.onmessage = (evt) => {
+            try {
+              const parsed = JSON.parse(evt.data) as MpaEntryEvent;
+              if (cancelled) return;
+              setMpaEntryEvents((prev) => {
+                const next = [parsed, ...prev];
+                return next.slice(0, 200);
+              });
+            } catch {
+              // ignore malformed event
+            }
+          };
+          es.onerror = () => {
+            if (cancelled) return;
+            setMpaTimelineError("Timeline disconnected (will retry automatically).");
+          };
+        }
       } catch (e: any) {
         if (cancelled) return;
         setMpaTimelineError(e?.message || String(e));
@@ -137,7 +167,7 @@ export default function Map() {
       cancelled = true;
       if (es) es.close();
     };
-  }, []);
+  }, [historicalMode, historicalIso]);
 
   useEffect(() => {
     if (!mapRef.current) return;
@@ -329,7 +359,13 @@ export default function Map() {
           max_lon: bounds.getEast().toString(),
           limit: "500",
         });
-        const res = await fetch(`${API_URL}/vessels/live?${params.toString()}`);
+        let vesselsUrl = `${API_URL}/vessels/live?${params.toString()}`;
+        if (historicalMode) {
+          if (!historicalIso) throw new Error("Invalid historical timestamp.");
+          params.set("ts", historicalIso);
+          vesselsUrl = `${API_URL}/vessels/asof?${params.toString()}`;
+        }
+        const res = await fetch(vesselsUrl);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data: LiveVessel[] = await res.json();
 
@@ -381,10 +417,11 @@ export default function Map() {
           if (allMmsis.length > 0) {
             const hours = clampInt(allTrailHours, 1, 72);
             const limit = clampInt(allTrailLimit, 1, 5000);
+            const endParam = historicalMode && historicalIso ? `&end_ts=${encodeURIComponent(historicalIso)}` : "";
             const allTrailResponses = await Promise.all(
               allMmsis.map((mmsi) =>
                 fetch(
-                  `${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${hours}&limit=${limit}`
+                  `${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${hours}&limit=${limit}${endParam}`
                 ).then((r) => (r.ok ? r.json() : null))
               )
             );
@@ -414,11 +451,12 @@ export default function Map() {
         if (violatorMmsis.length > 0 && violatorTrailsVisible) {
           const hours = clampInt(violatorTrailHours, 1, 72);
           const limit = clampInt(violatorTrailLimit, 1, 5000);
+          const endParam = historicalMode && historicalIso ? `&end_ts=${encodeURIComponent(historicalIso)}` : "";
           const trailResponses = await Promise.all(
             violatorMmsis.map((mmsi) =>
-              fetch(`${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${hours}&limit=${limit}`).then((r) =>
-                r.ok ? r.json() : null
-              )
+              fetch(
+                `${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${hours}&limit=${limit}${endParam}`
+              ).then((r) => (r.ok ? r.json() : null))
             )
           );
           const trailFeatures: GeoJSON.Feature<GeoJSON.LineString>[] = trailResponses.flatMap(
@@ -452,6 +490,8 @@ export default function Map() {
     allTrailLimit,
     violatorTrailHours,
     violatorTrailLimit,
+    historicalMode,
+    historicalIso,
   ]);
 
   useEffect(() => {
@@ -565,7 +605,10 @@ export default function Map() {
           if (hasViolations) {
             const hours = clampInt(selectedTrailHours, 1, 72);
             const limit = clampInt(selectedTrailLimit, 1, 5000);
-            const res = await fetch(`${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${hours}&limit=${limit}`);
+            const endParam = historicalMode && historicalIso ? `&end_ts=${encodeURIComponent(historicalIso)}` : "";
+            const res = await fetch(
+              `${API_URL}/vessels/${encodeURIComponent(mmsi)}/trail?hours=${hours}&limit=${limit}${endParam}`
+            );
             if (res.ok) {
               const data: VesselTrailResponse = await res.json();
               trailCount = data.count;
@@ -632,7 +675,7 @@ export default function Map() {
       map.off("click", onClick);
       map.off("mousemove", onMouseMove);
     };
-  }, [mapLoaded, zones, selectedTrailHours, selectedTrailLimit]);
+  }, [mapLoaded, zones, selectedTrailHours, selectedTrailLimit, historicalMode, historicalIso]);
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
@@ -652,6 +695,30 @@ export default function Map() {
       >
         <div style={{ fontWeight: 600, marginBottom: 8 }}>California MPAs</div>
         {error && <div style={{ color: "#c00", marginBottom: 8 }}>{error}</div>}
+        <div style={{ marginBottom: 10, paddingBottom: 10, borderBottom: "1px solid rgba(0,0,0,0.08)" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              checked={historicalMode}
+              onChange={(e) => setHistoricalMode(e.target.checked)}
+            />
+            <span style={{ fontWeight: 600 }}>Historical mode</span>
+          </label>
+          <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 8 }}>
+            <input
+              type="datetime-local"
+              value={historicalTsLocal}
+              disabled={!historicalMode}
+              onChange={(e) => setHistoricalTsLocal(e.target.value)}
+              style={{ fontFamily: "system-ui", fontSize: 13 }}
+            />
+            {historicalMode && (
+              <span style={{ fontSize: 12, color: "#555" }}>
+                {historicalIso ? `UTC: ${historicalIso}` : "Invalid time"}
+              </span>
+            )}
+          </div>
+        </div>
         <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
           <input
             type="checkbox"

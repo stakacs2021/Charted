@@ -60,6 +60,7 @@ from psycopg2.extensions import connection as PGConnection
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from database import DATABASE_URL  # type: ignore
 from mmsi_mid import mmsi_to_country
+from zone_classification import classify_bracket  # type: ignore
 
 
 @dataclass
@@ -74,6 +75,8 @@ class VesselRecord:
     callsign: Optional[str] = None
     cog: Optional[float] = None
     true_heading: Optional[float] = None
+    ais_ship_type_code: Optional[int] = None
+    vessel_type: Optional[str] = None
 
 
 def bearing_deg_lonlat(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
@@ -133,6 +136,65 @@ def _first(*values: Any) -> Any:
         if v is not None:
             return v
     return None
+
+
+def _normalize_vessel_type(raw_type: Any) -> tuple[Optional[int], Optional[str]]:
+    """
+    Best-effort normalization for heterogeneous AIS feeds.
+
+    Returns: (ais_ship_type_code, vessel_type_bucket)
+    Buckets are intentionally coarse: fishing, cargo, tanker, passenger, service, pleasure, research, military, unknown.
+    """
+    if raw_type is None:
+        return (None, None)
+
+    # Numeric AIS ship type code (commonly 0-99)
+    try:
+        if isinstance(raw_type, (int, float)) and not isinstance(raw_type, bool):
+            code = int(raw_type)
+            if code < 0 or code > 9999:
+                return (None, None)
+            bucket: Optional[str] = None
+            if 30 <= code <= 39:
+                bucket = "fishing"
+            elif 60 <= code <= 69:
+                bucket = "passenger"
+            elif 70 <= code <= 79:
+                bucket = "cargo"
+            elif 80 <= code <= 89:
+                bucket = "tanker"
+            elif 50 <= code <= 59:
+                bucket = "service"
+            elif 90 <= code <= 99:
+                bucket = "unknown"
+            return (code, bucket or "unknown")
+    except Exception:
+        pass
+
+    # String labels (some feeds provide type names)
+    if isinstance(raw_type, str):
+        s = raw_type.strip().lower()
+        if not s:
+            return (None, None)
+        if "fish" in s:
+            return (None, "fishing")
+        if "tanker" in s:
+            return (None, "tanker")
+        if "cargo" in s or "freight" in s or "container" in s:
+            return (None, "cargo")
+        if "passenger" in s or "cruise" in s or "ferry" in s:
+            return (None, "passenger")
+        if "pleasure" in s or "yacht" in s or "recreat" in s:
+            return (None, "pleasure")
+        if "research" in s or "survey" in s or "science" in s:
+            return (None, "research")
+        if "navy" in s or "milit" in s or "war" in s:
+            return (None, "military")
+        if "tug" in s or "pilot" in s or "law" in s or "coast guard" in s or "service" in s:
+            return (None, "service")
+        return (None, "unknown")
+
+    return (None, None)
 
 
 def normalize_record(raw: Dict[str, Any]) -> Optional[VesselRecord]:
@@ -202,6 +264,19 @@ def normalize_record(raw: Dict[str, Any]) -> Optional[VesselRecord]:
         _first(raw.get("true_heading"), raw.get("TrueHeading"), raw.get("heading"), raw.get("hdg"))
     )
 
+    raw_ship_type = _first(
+        raw.get("shiptype"),
+        raw.get("ship_type"),
+        raw.get("shipType"),
+        raw.get("vessel_type"),
+        raw.get("vesselType"),
+        raw.get("type"),
+        raw.get("ShipType"),
+        raw.get("SHIPTYPE"),
+        raw.get("SHIP_TYPE"),
+    )
+    ais_ship_type_code, vessel_type = _normalize_vessel_type(raw_ship_type)
+
     return VesselRecord(
         mmsi=str(mmsi),
         lat=lat_f,
@@ -213,6 +288,8 @@ def normalize_record(raw: Dict[str, Any]) -> Optional[VesselRecord]:
         country_iso2=country_iso2,
         cog=cog,
         true_heading=true_heading,
+        ais_ship_type_code=ais_ship_type_code,
+        vessel_type=vessel_type,
     )
 
 
@@ -331,7 +408,16 @@ def ensure_core_schema(conn: PGConnection) -> None:
             ADD COLUMN IF NOT EXISTS country_iso2 TEXT,
             ADD COLUMN IF NOT EXISTS cog DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS true_heading DOUBLE PRECISION,
-            ADD COLUMN IF NOT EXISTS bearing_deg DOUBLE PRECISION;
+            ADD COLUMN IF NOT EXISTS bearing_deg DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS ais_ship_type_code INTEGER,
+            ADD COLUMN IF NOT EXISTS vessel_type TEXT;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE zones
+            ADD COLUMN IF NOT EXISTS bracket_class TEXT,
+            ADD COLUMN IF NOT EXISTS bracket_source TEXT;
             """
         )
         cur.execute(
@@ -394,6 +480,107 @@ def ensure_core_schema(conn: PGConnection) -> None:
             );
             """
         )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS zone_vessel_type_policy (
+                zone_bracket_class TEXT NOT NULL,
+                vessel_type TEXT NOT NULL,
+                allowed BOOLEAN NOT NULL,
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (zone_bracket_class, vessel_type)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE OR REPLACE FUNCTION is_vessel_allowed_in_zone(p_mmsi TEXT, p_zone_id INTEGER)
+            RETURNS BOOLEAN
+            LANGUAGE plpgsql
+            AS $$
+            DECLARE
+                v_allowed BOOLEAN;
+                v_vessel_type TEXT;
+                v_bracket TEXT;
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM mpa_violation_allowlist
+                    WHERE mmsi = p_mmsi AND zone_id = p_zone_id
+                ) THEN
+                    RETURN TRUE;
+                END IF;
+
+                SELECT vessel_type INTO v_vessel_type
+                FROM vessels
+                WHERE mmsi = p_mmsi;
+
+                SELECT bracket_class INTO v_bracket
+                FROM zones
+                WHERE id = p_zone_id;
+
+                IF v_vessel_type IS NULL OR v_bracket IS NULL THEN
+                    RETURN FALSE;
+                END IF;
+
+                SELECT allowed INTO v_allowed
+                FROM zone_vessel_type_policy
+                WHERE zone_bracket_class = v_bracket
+                  AND vessel_type = v_vessel_type;
+
+                RETURN COALESCE(v_allowed, FALSE);
+            END;
+            $$;
+            """
+        )
+        cur.execute(
+            """
+            CREATE OR REPLACE FUNCTION mpa_violations_enforce_vessel_type_policy()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                IF is_vessel_allowed_in_zone(NEW.mmsi, NEW.zone_id) THEN
+                    RETURN NULL;
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+            """
+        )
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_trigger WHERE tgname = 'trg_mpa_violations_policy'
+                ) THEN
+                    CREATE TRIGGER trg_mpa_violations_policy
+                    BEFORE INSERT ON mpa_violations
+                    FOR EACH ROW
+                    EXECUTE FUNCTION mpa_violations_enforce_vessel_type_policy();
+                END IF;
+            END
+            $$;
+            """
+        )
+
+        # Backfill bracket_class/bracket_source for existing zones (idempotent)
+        cur.execute(
+            "SELECT id, name, designation FROM zones WHERE bracket_class IS NULL OR bracket_source IS NULL"
+        )
+        zone_rows = cur.fetchall()
+        for zid, name, designation in zone_rows:
+            bracket = classify_bracket(designation=designation, zone_id=zid, name=name)
+            cur.execute(
+                """
+                UPDATE zones
+                SET bracket_class = %s,
+                    bracket_source = %s
+                WHERE id = %s
+                """,
+                (bracket.bracket_class, bracket.bracket_source, zid),
+            )
     conn.commit()
 
 
@@ -443,8 +630,12 @@ def process_batch(conn: PGConnection, records: Iterable[VesselRecord]) -> int:
 
             cur.execute(
                 """
-                INSERT INTO vessels (mmsi, name, last_lat, last_lon, last_ts, last_inside, last_zone_ids, country, country_iso2, callsign, cog, true_heading)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO vessels (
+                    mmsi, name, last_lat, last_lon, last_ts, last_inside, last_zone_ids,
+                    country, country_iso2, callsign, cog, true_heading,
+                    ais_ship_type_code, vessel_type
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (mmsi) DO UPDATE SET
                     name = COALESCE(EXCLUDED.name, vessels.name),
                     last_lat = EXCLUDED.last_lat,
@@ -456,7 +647,9 @@ def process_batch(conn: PGConnection, records: Iterable[VesselRecord]) -> int:
                     country_iso2 = COALESCE(EXCLUDED.country_iso2, vessels.country_iso2),
                     callsign = COALESCE(EXCLUDED.callsign, vessels.callsign),
                     cog = COALESCE(EXCLUDED.cog, vessels.cog),
-                    true_heading = COALESCE(EXCLUDED.true_heading, vessels.true_heading);
+                    true_heading = COALESCE(EXCLUDED.true_heading, vessels.true_heading),
+                    ais_ship_type_code = COALESCE(EXCLUDED.ais_ship_type_code, vessels.ais_ship_type_code),
+                    vessel_type = COALESCE(EXCLUDED.vessel_type, vessels.vessel_type);
                 """,
                 (
                     rec.mmsi,
@@ -471,6 +664,8 @@ def process_batch(conn: PGConnection, records: Iterable[VesselRecord]) -> int:
                     rec.callsign,
                     rec.cog,
                     rec.true_heading,
+                    rec.ais_ship_type_code,
+                    rec.vessel_type,
                 ),
             )
 
