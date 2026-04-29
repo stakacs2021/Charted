@@ -36,14 +36,17 @@ def ensure_extended_schema():
             ALTER TABLE vessels
             ADD COLUMN IF NOT EXISTS last_inside BOOLEAN,
             ADD COLUMN IF NOT EXISTS last_zone_ids INTEGER[],
+            ADD COLUMN IF NOT EXISTS inside_since_ts TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS country TEXT,
             ADD COLUMN IF NOT EXISTS callsign TEXT,
             ADD COLUMN IF NOT EXISTS country_iso2 TEXT,
             ADD COLUMN IF NOT EXISTS cog DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS true_heading DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS bearing_deg DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS sog DOUBLE PRECISION,
             ADD COLUMN IF NOT EXISTS ais_ship_type_code INTEGER,
-            ADD COLUMN IF NOT EXISTS vessel_type TEXT;
+            ADD COLUMN IF NOT EXISTS vessel_type TEXT,
+            ADD COLUMN IF NOT EXISTS bucket_source TEXT;
             """
         )
         cur.execute(
@@ -61,8 +64,15 @@ def ensure_extended_schema():
                 ts TIMESTAMPTZ NOT NULL,
                 lat DOUBLE PRECISION NOT NULL,
                 lon DOUBLE PRECISION NOT NULL,
+                sog DOUBLE PRECISION,
                 geom GEOMETRY(POINT, 4326) NOT NULL
             );
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE vessel_positions
+            ADD COLUMN IF NOT EXISTS sog DOUBLE PRECISION;
             """
         )
         cur.execute(
@@ -93,11 +103,54 @@ def ensure_extended_schema():
             """
             CREATE TABLE IF NOT EXISTS mpa_violation_allowlist (
                 mmsi TEXT NOT NULL,
-                zone_id INTEGER NOT NULL REFERENCES zones (id) ON DELETE CASCADE,
+                zone_id INTEGER REFERENCES zones (id) ON DELETE CASCADE,
                 note TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (mmsi, zone_id)
+                category TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            """
+        )
+        # Migrate from older NOT NULL + composite PK schema if present (idempotent)
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'mpa_violation_allowlist'
+                      AND column_name = 'zone_id'
+                      AND is_nullable = 'NO'
+                ) THEN
+                    ALTER TABLE mpa_violation_allowlist ALTER COLUMN zone_id DROP NOT NULL;
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'mpa_violation_allowlist_pkey'
+                ) THEN
+                    ALTER TABLE mpa_violation_allowlist DROP CONSTRAINT mpa_violation_allowlist_pkey;
+                END IF;
+            END
+            $$;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE mpa_violation_allowlist
+            ADD COLUMN IF NOT EXISTS category TEXT;
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS mpa_allowlist_pair
+                ON mpa_violation_allowlist (mmsi, zone_id)
+                WHERE zone_id IS NOT NULL;
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS mpa_allowlist_wild
+                ON mpa_violation_allowlist (mmsi)
+                WHERE zone_id IS NULL;
             """
         )
         cur.execute(
@@ -125,7 +178,8 @@ def ensure_extended_schema():
             BEGIN
                 IF EXISTS (
                     SELECT 1 FROM mpa_violation_allowlist
-                    WHERE mmsi = p_mmsi AND zone_id = p_zone_id
+                    WHERE mmsi = p_mmsi
+                      AND (zone_id = p_zone_id OR zone_id IS NULL)
                 ) THEN
                     RETURN TRUE;
                 END IF;
@@ -138,8 +192,12 @@ def ensure_extended_schema():
                 FROM zones
                 WHERE id = p_zone_id;
 
-                IF v_vessel_type IS NULL OR v_bracket IS NULL THEN
+                IF v_bracket IS NULL THEN
                     RETURN FALSE;
+                END IF;
+
+                IF v_vessel_type IS NULL OR v_vessel_type = '' THEN
+                    v_vessel_type := 'unknown';
                 END IF;
 
                 SELECT allowed INTO v_allowed
@@ -905,6 +963,125 @@ def history_mpa_entries_window(
             "zone_name": r["zone_name"],
             "entry_ts": r["entry_ts"],
             "source": r["source"],
+        }
+        for r in rows
+    ]
+
+
+# ---------- Feature 5: admin / curation endpoints ----------
+
+@app.get("/admin/vessel-type-coverage")
+def admin_vessel_type_coverage():
+    """
+    Coverage telemetry for vessel_type / bucket_source. Use this to decide
+    when to flip seed_policy.py from permissive (`unknown=allowed`) to strict.
+    """
+    with get_cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM vessels")
+        total = int(cur.fetchone()["n"])
+
+        cur.execute(
+            """
+            SELECT COALESCE(NULLIF(vessel_type, ''), 'NULL') AS bucket,
+                   COUNT(*)::int AS n
+            FROM vessels
+            GROUP BY 1
+            ORDER BY n DESC
+            """
+        )
+        by_bucket = {r["bucket"]: r["n"] for r in cur.fetchall()}
+
+        cur.execute(
+            """
+            SELECT COALESCE(NULLIF(bucket_source, ''), 'NULL') AS src,
+                   COUNT(*)::int AS n
+            FROM vessels
+            GROUP BY 1
+            ORDER BY n DESC
+            """
+        )
+        by_source = {r["src"]: r["n"] for r in cur.fetchall()}
+
+        # How many *violators* still have unknown type? Drives the "is type policy actually working" question.
+        cur.execute(
+            """
+            SELECT COALESCE(NULLIF(v.vessel_type, ''), 'NULL') AS bucket,
+                   COUNT(DISTINCT v.mmsi)::int AS n
+            FROM vessels v
+            JOIN mpa_violations mv ON mv.mmsi = v.mmsi
+            GROUP BY 1
+            ORDER BY n DESC
+            """
+        )
+        violators_by_bucket = {r["bucket"]: r["n"] for r in cur.fetchall()}
+
+    known = total - by_bucket.get("NULL", 0)
+    coverage_pct = round(100.0 * known / total, 1) if total else 0.0
+
+    return {
+        "total_vessels": total,
+        "known_type": known,
+        "coverage_pct": coverage_pct,
+        "by_bucket": by_bucket,
+        "by_source": by_source,
+        "violators_by_bucket": violators_by_bucket,
+    }
+
+
+@app.get("/admin/violators/review")
+def admin_violators_review(
+    limit: int = Query(50, ge=1, le=500, description="Max violators to return"),
+):
+    """
+    Leaderboard enriched with vessel_type / country / callsign and a flag for whether
+    the MMSI is already on the allowlist. Intended for hand-curation of the seed CSV.
+    """
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            WITH ranked AS (
+                SELECT v.mmsi, v.name, v.country, v.country_iso2, v.callsign,
+                       v.vessel_type, v.ais_ship_type_code, v.bucket_source,
+                       COUNT(mv.id)::int AS violation_count,
+                       MAX(mv.entry_ts) AS last_violation_ts,
+                       array_length(array_agg(DISTINCT mv.zone_id), 1) AS distinct_zones
+                FROM vessels v
+                JOIN mpa_violations mv ON mv.mmsi = v.mmsi
+                GROUP BY v.mmsi, v.name, v.country, v.country_iso2, v.callsign,
+                         v.vessel_type, v.ais_ship_type_code, v.bucket_source
+                ORDER BY violation_count DESC
+                LIMIT %s
+            )
+            SELECT r.*,
+                   EXISTS(
+                       SELECT 1 FROM mpa_violation_allowlist a
+                       WHERE a.mmsi = r.mmsi AND a.zone_id IS NULL
+                   ) AS allowlisted_global,
+                   (
+                       SELECT COUNT(*)::int FROM mpa_violation_allowlist a
+                       WHERE a.mmsi = r.mmsi AND a.zone_id IS NOT NULL
+                   ) AS allowlisted_zone_count
+            FROM ranked r
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "mmsi": r["mmsi"],
+            "name": r["name"],
+            "country": r["country"],
+            "country_iso2": r["country_iso2"],
+            "callsign": r["callsign"],
+            "vessel_type": r["vessel_type"],
+            "ais_ship_type_code": r["ais_ship_type_code"],
+            "bucket_source": r["bucket_source"],
+            "violation_count": r["violation_count"],
+            "distinct_zones": r["distinct_zones"],
+            "last_violation_ts": r["last_violation_ts"],
+            "allowlisted_global": bool(r["allowlisted_global"]),
+            "allowlisted_zone_count": r["allowlisted_zone_count"],
         }
         for r in rows
     ]

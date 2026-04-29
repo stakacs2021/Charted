@@ -1,0 +1,16 @@
+mmsi,category,note
+# Per-MMSI allowlist for vessels whose presence in MPAs should never be flagged.
+# Each row inserts one (mmsi, zone_id=NULL) wildcard row into mpa_violation_allowlist.
+#
+# Categories:
+#   government    - state/federal patrol & enforcement (USCG, CDFW, NOAA OLE, NPS)
+#   research      - permitted research / academic vessels (NOAA fleet, MBARI, SIO)
+#   pilot         - port pilot boats (legally required to enter all CA harbors)
+#   ferry         - permitted passenger ferries on routes that overlap MPAs
+#   sar           - search-and-rescue
+#   permit        - holders of specific take/transit permits (e.g. tribal subsistence)
+#
+# Format example (uncomment & fill with real MMSIs to use):
+# 366970320,research,NOAA R/V Reuben Lasker
+# 369970201,government,USCGC Stratton (WMSL-752)
+# 366972170,government,CDFW Patrol Vessel

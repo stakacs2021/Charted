@@ -1,0 +1,8 @@
+mmsi,vessel_type,note
+# Curated vessel-type overrides for ships that don't reliably broadcast AIS Type 5 / 24
+# or whose AIS-broadcast type is generic. Edit by hand and re-run seed_overrides.py.
+# Columns: mmsi (string), vessel_type (one of: fishing|cargo|tanker|passenger|service|pleasure|research|military|unknown), note.
+#
+# Format example (uncomment to use):
+# 366970320,research,NOAA R/V Reuben Lasker
+# 369970201,military,USCGC Stratton

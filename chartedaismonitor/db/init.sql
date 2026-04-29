@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS vessels (
     last_inside BOOLEAN,
     -- IDs of zones the vessel was last known to be inside (for multi-zone entries)
     last_zone_ids INTEGER[],
+    -- When the vessel first transitioned to inside (NULL when outside). Drives dwell-time gate.
+    inside_since_ts TIMESTAMPTZ,
     -- Enrichment fields (may be populated by ingest)
     country TEXT,
     callsign TEXT,
@@ -35,9 +37,12 @@ CREATE TABLE IF NOT EXISTS vessels (
     cog DOUBLE PRECISION,
     true_heading DOUBLE PRECISION,
     bearing_deg DOUBLE PRECISION,
+    sog DOUBLE PRECISION,
     -- Vessel-type policy inputs
     ais_ship_type_code INTEGER,
-    vessel_type TEXT
+    vessel_type TEXT,
+    -- Provenance for vessel_type: 'ais' | 'name_regex' | 'csv_override' | 'enrichment_api'
+    bucket_source TEXT
 );
 
 -- Optional: index for vessel lookups by MMSI (pk already gives this)
@@ -50,6 +55,7 @@ CREATE TABLE IF NOT EXISTS vessel_positions (
     ts TIMESTAMPTZ NOT NULL,
     lat DOUBLE PRECISION NOT NULL,
     lon DOUBLE PRECISION NOT NULL,
+    sog DOUBLE PRECISION,
     geom GEOMETRY(POINT, 4326) NOT NULL
 );
 
@@ -77,14 +83,22 @@ CREATE INDEX IF NOT EXISTS idx_mpa_violations_zone_entry
 CREATE INDEX IF NOT EXISTS idx_mpa_violations_mmsi_entry
     ON mpa_violations (mmsi, entry_ts);
 
--- Optional: per-(mmsi, zone) allowlist — ingest skips inserting mpa_violations for these pairs (editable live via SQL).
+-- Per-(mmsi, zone) allowlist — ingest skips inserting mpa_violations for these pairs (editable live via SQL).
+-- zone_id NULL means "all zones" (wildcard) — covers institutional fleets like USCG, NOAA, port pilots.
 CREATE TABLE IF NOT EXISTS mpa_violation_allowlist (
     mmsi TEXT NOT NULL,
-    zone_id INTEGER NOT NULL REFERENCES zones (id) ON DELETE CASCADE,
+    zone_id INTEGER REFERENCES zones (id) ON DELETE CASCADE,
     note TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (mmsi, zone_id)
+    category TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS mpa_allowlist_pair
+    ON mpa_violation_allowlist (mmsi, zone_id)
+    WHERE zone_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS mpa_allowlist_wild
+    ON mpa_violation_allowlist (mmsi)
+    WHERE zone_id IS NULL;
 
 -- Per-zone policy: which vessel types are allowed in which bracket_class (designation category).
 -- If a row is missing, the default behavior is "NOT allowed" unless explicitly allowlisted.
@@ -98,8 +112,8 @@ CREATE TABLE IF NOT EXISTS zone_vessel_type_policy (
 );
 
 -- Resolve whether a vessel is allowed to be in a zone, combining:
--- 1) explicit per-(mmsi, zone_id) allowlist override
--- 2) bracket_class + vessel_type policy
+-- 1) explicit per-(mmsi, zone_id) allowlist override (zone_id IS NULL = all zones)
+-- 2) bracket_class + vessel_type policy. NULL vessel_type collapses to bucket 'unknown'.
 CREATE OR REPLACE FUNCTION is_vessel_allowed_in_zone(p_mmsi TEXT, p_zone_id INTEGER)
 RETURNS BOOLEAN
 LANGUAGE plpgsql
@@ -109,10 +123,11 @@ DECLARE
     v_vessel_type TEXT;
     v_bracket TEXT;
 BEGIN
-    -- Explicit allowlist override
+    -- Explicit allowlist override (specific zone or wildcard)
     IF EXISTS (
         SELECT 1 FROM mpa_violation_allowlist
-        WHERE mmsi = p_mmsi AND zone_id = p_zone_id
+        WHERE mmsi = p_mmsi
+          AND (zone_id = p_zone_id OR zone_id IS NULL)
     ) THEN
         RETURN TRUE;
     END IF;
@@ -125,8 +140,14 @@ BEGIN
     FROM zones
     WHERE id = p_zone_id;
 
-    IF v_vessel_type IS NULL OR v_bracket IS NULL THEN
+    IF v_bracket IS NULL THEN
         RETURN FALSE;
+    END IF;
+
+    -- NULL or empty vessel_type falls into the explicit 'unknown' bucket so we can
+    -- have a coverage-aware fallback policy instead of auto-deny.
+    IF v_vessel_type IS NULL OR v_vessel_type = '' THEN
+        v_vessel_type := 'unknown';
     END IF;
 
     SELECT allowed INTO v_allowed

@@ -23,7 +23,16 @@ if str(_backend) not in sys.path:
     sys.path.insert(0, str(_backend))
 from database import DATABASE_URL
 from mmsi_mid import mmsi_to_country
-from scripts.ingest_ais import VesselRecord, ensure_core_schema, parse_ais_angle_deg, process_batch
+from scripts.ingest_ais import (
+    StaticVesselRecord,
+    VesselRecord,
+    _normalize_vessel_type,
+    ensure_core_schema,
+    parse_ais_angle_deg,
+    parse_ais_sog_kn,
+    process_batch,
+    process_static_batch,
+)
 
 # California coast bounding box (same as other ingest)
 # Format: [[[lat1, lon1], [lat2, lon2]]]
@@ -47,7 +56,11 @@ def _parse_aisstream_time(raw: str) -> datetime:
 
 
 def message_to_record(msg: dict) -> VesselRecord | None:
-    """Build VesselRecord from AISStream message (MetaData or Message.PositionReport)."""
+    """
+    Build VesselRecord from an AISStream position-bearing message:
+    PositionReport / ExtendedClassBPositionReport / StandardClassBPositionReport.
+    Returns None if the message has no position payload.
+    """
     meta = msg.get("MetaData") or msg.get("Metadata") or {}
     lat = meta.get("latitude") or meta.get("Latitude")
     lon = meta.get("longitude") or meta.get("Longitude")
@@ -56,10 +69,15 @@ def message_to_record(msg: dict) -> VesselRecord | None:
     if "Message" in msg:
         m = msg["Message"]
         pr = m.get("PositionReport") or m.get("ExtendedClassBPositionReport") or m.get("StandardClassBPositionReport")
-        if mmsi is None and pr is not None:
-            lat = lat or pr.get("Latitude")
-            lon = lon or pr.get("Longitude")
-            mmsi = mmsi or pr.get("UserID")
+        # Backfill from the position payload when MetaData is missing fields
+        # (AISStream usually duplicates them but tests / older feeds may not).
+        if pr is not None:
+            if lat is None:
+                lat = pr.get("Latitude")
+            if lon is None:
+                lon = pr.get("Longitude")
+            if mmsi is None:
+                mmsi = pr.get("UserID")
     if mmsi is None or lat is None or lon is None:
         return None
     try:
@@ -79,9 +97,17 @@ def message_to_record(msg: dict) -> VesselRecord | None:
 
     cog = None
     true_heading = None
+    sog = None
+    ais_ship_type_code = None
+    vessel_type = None
     if pr is not None:
         cog = parse_ais_angle_deg(pr.get("Cog"))
         true_heading = parse_ais_angle_deg(pr.get("TrueHeading"))
+        sog = parse_ais_sog_kn(pr.get("Sog"))
+        # ExtendedClassBPositionReport carries ShipType inline; PositionReport (Type 1/2/3) does not.
+        raw_type = pr.get("ShipType") or pr.get("Type")
+        if raw_type is not None:
+            ais_ship_type_code, vessel_type = _normalize_vessel_type(raw_type)
 
     return VesselRecord(
         mmsi=str(mmsi),
@@ -94,6 +120,56 @@ def message_to_record(msg: dict) -> VesselRecord | None:
         country_iso2=country_iso2,
         cog=cog,
         true_heading=true_heading,
+        sog=sog,
+        ais_ship_type_code=ais_ship_type_code,
+        vessel_type=vessel_type,
+        bucket_source="ais" if vessel_type else None,
+    )
+
+
+def message_to_static_record(msg: dict) -> StaticVesselRecord | None:
+    """
+    Build a StaticVesselRecord from AISStream `Message.ShipStaticData` (Type 5 / 24).
+    These messages carry identity + ship type but no lat/lon, so they only update
+    the static fields on the `vessels` row.
+    """
+    if "Message" not in msg:
+        return None
+    static = msg["Message"].get("ShipStaticData")
+    if static is None:
+        return None
+
+    meta = msg.get("MetaData") or msg.get("Metadata") or {}
+    mmsi = meta.get("MMSI") or static.get("UserID")
+    if mmsi is None:
+        return None
+
+    name = meta.get("ShipName") or meta.get("shipname") or static.get("Name")
+    callsign = (
+        meta.get("CallSign")
+        or meta.get("Callsign")
+        or meta.get("callSign")
+        or static.get("CallSign")
+    )
+    raw_type = static.get("Type")
+    ais_ship_type_code, vessel_type = _normalize_vessel_type(raw_type)
+
+    country = None
+    country_iso2 = None
+    info = mmsi_to_country(str(mmsi))
+    if info:
+        country = info[0]
+        country_iso2 = info[1]
+
+    return StaticVesselRecord(
+        mmsi=str(mmsi),
+        name=str(name).strip() if isinstance(name, str) else name,
+        callsign=str(callsign).strip() if isinstance(callsign, str) else callsign,
+        country=country,
+        country_iso2=country_iso2,
+        ais_ship_type_code=ais_ship_type_code,
+        vessel_type=vessel_type,
+        bucket_source="ais" if vessel_type else None,
     )
 
 
@@ -134,6 +210,17 @@ async def run_stream(api_key: str):
                 if "error" in msg:
                     print("AISStream error:", msg["error"])
                     break
+                # Route ShipStaticData (Type 5 / 24) into the static-only upsert path so
+                # vessel_type / ais_ship_type_code populate even if no PositionReport
+                # ever carries the type field.
+                static = message_to_static_record(msg)
+                if static is not None:
+                    try:
+                        process_static_batch(conn, [static])
+                    except Exception as e:
+                        print(f"DB static write failed for {static.mmsi}: {e}")
+                    # Static-only messages have no lat/lon; nothing more to do.
+                    continue
                 record = message_to_record(msg)
                 if record is None:
                     continue

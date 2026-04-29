@@ -8,36 +8,65 @@ Web app that monitors vessel locations near the California coast and checks whet
 - **Course / heading** — COG and true heading are ingested when present; the map rotates ship icons using **bearing** (COG, else heading, else bearing from the last two stored positions).
 - **Trails** — Optional **MPA violator** trails (red) and optional **all vessels in view** trails (blue, capped at 40 ships per refresh for performance).
 - **Leaderboard** — `/leaderboard` lists top MMSIs by MPA entry count.
-- **Violation allowlist (live)** — Table `mpa_violation_allowlist` holds `(mmsi, zone_id)` pairs where **ingest will not insert** an `mpa_violations` row on entry. Edit with SQL anytime; changes apply on the next AIS position (no app redeploy). See below.
+- **Violation suppression pipeline** — Four layers, applied in this order on every AIS fix:
+  1. **Ingest heuristics** in `process_batch` — drop fast-moving transits (`SOG > MPA_SPEED_TRANSIT_KN`, default 5 kn), brief crossings (`MIN_DWELL_SECONDS`, default 120 s), and edge clipping (`BOUNDARY_BUFFER_M`, default 30 m).
+  2. **Per-MMSI allowlist** (`mpa_violation_allowlist`) — `(mmsi, zone_id)` rows. `zone_id IS NULL` means "all zones" (used for institutional fleets like USCG, NOAA, port pilots).
+  3. **Vessel-type policy** (`zone_vessel_type_policy`) — `(zone_bracket_class, vessel_type) → allowed`. Default stance after `seed_policy.py`: transit is legal for non-fishing types in every bracket; fishing in `NoTake` and `SpecialClosure` is denied.
+  4. **DB trigger** `trg_mpa_violations_policy` — calls `is_vessel_allowed_in_zone(mmsi, zone_id)`, which combines the above and treats NULL `vessel_type` as the configurable `'unknown'` bucket.
+- All layers are live-editable: tune `MPA_*` env vars in `.env`, run `seed_policy.py` / `seed_allowlist.py` / `enrich_vessel_types.py` whenever rules change. No redeploy required.
 
-### MPA violation allowlist (no redeploy)
+### Seeding the suppression rules (one-time per environment)
 
-Zones still render on the map; only **violation recording** is skipped for matching pairs.
+```bash
+# 1. Type-policy defaults (transit-legal; fishing-deny in strict zones).
+docker compose exec backend python scripts/seed_policy.py
+# 1b. Optionally tighten unknown-type fallback once vessel_type coverage is good:
+docker compose exec backend python scripts/seed_policy.py --strict-unknown
 
-1. Find a zone id (e.g. from `/zones` GeoJSON `properties.id` or `/debug/stats`).
-2. Insert or delete rows:
+# 2. Wildcard allowlist for institutional fleets (edit allowlist_seed.csv first).
+docker compose exec backend python scripts/seed_allowlist.py
+
+# 3. Backfill vessel_type for rows ingest didn't label (CSV overrides + name regex).
+docker compose exec backend python scripts/enrich_vessel_types.py --dry-run
+docker compose exec backend python scripts/enrich_vessel_types.py
+```
+
+### Curating the allowlist by hand
 
 ```sql
--- Allow MMSI 123456789 to enter zone 42 without recording a violation
+-- Whitelist a single MMSI in every zone (institutional / wildcard).
+INSERT INTO mpa_violation_allowlist (mmsi, zone_id, category, note)
+VALUES ('123456789', NULL, 'government', 'USCGC Foo')
+ON CONFLICT (mmsi) WHERE zone_id IS NULL DO UPDATE SET note = EXCLUDED.note;
+
+-- Whitelist a single MMSI in one specific zone (per-site permit).
 INSERT INTO mpa_violation_allowlist (mmsi, zone_id, note)
 VALUES ('123456789', 42, 'Charter permit')
-ON CONFLICT (mmsi, zone_id) DO UPDATE SET note = EXCLUDED.note;
+ON CONFLICT (mmsi, zone_id) WHERE zone_id IS NOT NULL DO UPDATE SET note = EXCLUDED.note;
 
--- Remove the exception
+-- Remove either kind.
+DELETE FROM mpa_violation_allowlist WHERE mmsi = '123456789' AND zone_id IS NULL;
 DELETE FROM mpa_violation_allowlist WHERE mmsi = '123456789' AND zone_id = 42;
 ```
 
 From Docker (host shell):
 
 ```bash
-docker compose exec db psql -U ais_user -d ais -c "SELECT * FROM mpa_violation_allowlist ORDER BY zone_id, mmsi;"
+docker compose exec db psql -U ais_user -d ais \
+  -c "SELECT mmsi, zone_id, category, note FROM mpa_violation_allowlist ORDER BY mmsi, zone_id NULLS FIRST;"
 ```
 
-The ingest script creates this table if missing (`ensure_core_schema` / API startup). Existing databases get the table on the next **backend** or **ingest** run after upgrade.
+### Admin / curation endpoints
+
+- `GET /admin/vessel-type-coverage` — what fraction of vessels (and current violators) have a known type. Drives the decision to flip `seed_policy.py --strict-unknown`.
+- `GET /admin/violators/review?limit=50` — top violators enriched with `vessel_type`, `country`, `callsign`, `bucket_source`, and `allowlisted_global` flag. Use this to discover which MMSIs to add to `allowlist_seed.csv`.
+
+The ingest scripts and API both run `ensure_core_schema` / `ensure_extended_schema` at startup, so existing databases pick up the new columns, indexes, and trigger automatically on the next backend or ingest restart.
 
 ### Docs
 
 - **[Self-hosting on Ubuntu](SELF_HOST.md)** — Docker, Nginx, TLS, firewall, ingest service, backups.
+- **[Testing & live rollout](TESTING.md)** — test inventory, sidecar-DB recipe for testing without touching production, canary plan, rollback knobs.
 - **[Contributing & Git cadence](CONTRIBUTING.md)** — Weekly commits, branches, secrets hygiene.
 
 ---
